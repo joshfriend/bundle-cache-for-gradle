@@ -221,14 +221,20 @@ func resolveAWSCredentials(region string) (awsCreds, error) {
 	return awsCreds{}, errors.New("no AWS credentials found (checked env, ~/.aws/credentials, IMDS)")
 }
 
-// credentialsFromFile reads credentials from ~/.aws/credentials using the
-// profile named by AWS_PROFILE / AWS_DEFAULT_PROFILE (default: "default").
+// credentialsFromFile reads credentials from the AWS credentials file.
+// The path defaults to ~/.aws/credentials but can be overridden with
+// AWS_SHARED_CREDENTIALS_FILE. The profile is selected by AWS_PROFILE /
+// AWS_DEFAULT_PROFILE (default: "default").
 func credentialsFromFile() (awsCreds, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return awsCreds{}, err
+	credsPath := os.Getenv("AWS_SHARED_CREDENTIALS_FILE")
+	if credsPath == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return awsCreds{}, err
+		}
+		credsPath = filepath.Join(home, ".aws", "credentials")
 	}
-	f, err := os.Open(filepath.Join(home, ".aws", "credentials"))
+	f, err := os.Open(credsPath)
 	if err != nil {
 		return awsCreds{}, err
 	}
