@@ -2,7 +2,6 @@
 package main
 
 import (
-	"archive/tar"
 	"bytes"
 	"context"
 	"fmt"
@@ -496,120 +495,6 @@ func TestHistoryCommits(t *testing.T) {
 	})
 }
 
-// ─── extractTar parallel extraction tests ────────────────────────────────────
-
-func TestExtractTar(t *testing.T) {
-	t.Run("regular file and directory are extracted", func(t *testing.T) {
-		var buf bytes.Buffer
-		tw := tar.NewWriter(&buf)
-		must(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: "subdir/", Mode: 0o755}))
-		data := []byte("hello world")
-		must(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "subdir/hello.txt", Mode: 0o644, Size: int64(len(data))}))
-		_, err := tw.Write(data)
-		must(t, err)
-		must(t, tw.Close())
-
-		dir := t.TempDir()
-		must(t, extractTar(&buf, dir))
-
-		got, err := os.ReadFile(filepath.Join(dir, "subdir", "hello.txt"))
-		if err != nil {
-			t.Fatalf("read extracted file: %v", err)
-		}
-		if string(got) != "hello world" {
-			t.Errorf("content = %q, want %q", string(got), "hello world")
-		}
-	})
-
-	t.Run("symlink is created", func(t *testing.T) {
-		var buf bytes.Buffer
-		tw := tar.NewWriter(&buf)
-		data := []byte("target content")
-		must(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "real.txt", Mode: 0o644, Size: int64(len(data))}))
-		_, err := tw.Write(data)
-		must(t, err)
-		must(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeSymlink, Name: "link.txt", Linkname: "real.txt"}))
-		must(t, tw.Close())
-
-		dir := t.TempDir()
-		must(t, extractTar(&buf, dir))
-
-		target, err := os.Readlink(filepath.Join(dir, "link.txt"))
-		if err != nil {
-			t.Fatalf("readlink: %v", err)
-		}
-		if target != "real.txt" {
-			t.Errorf("symlink target = %q, want %q", target, "real.txt")
-		}
-	})
-
-	t.Run("multiple files extracted in parallel", func(t *testing.T) {
-		var buf bytes.Buffer
-		tw := tar.NewWriter(&buf)
-		for i := range 20 {
-			name := fmt.Sprintf("file%02d.txt", i)
-			data := []byte(fmt.Sprintf("content %d", i))
-			must(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: name, Mode: 0o644, Size: int64(len(data))}))
-			_, err := tw.Write(data)
-			must(t, err)
-		}
-		must(t, tw.Close())
-
-		dir := t.TempDir()
-		must(t, extractTar(&buf, dir))
-
-		for i := range 20 {
-			name := fmt.Sprintf("file%02d.txt", i)
-			got, err := os.ReadFile(filepath.Join(dir, name))
-			if err != nil {
-				t.Errorf("read %s: %v", name, err)
-				continue
-			}
-			want := fmt.Sprintf("content %d", i)
-			if string(got) != want {
-				t.Errorf("%s: content = %q, want %q", name, string(got), want)
-			}
-		}
-	})
-
-	t.Run("path traversal is rejected", func(t *testing.T) {
-		var buf bytes.Buffer
-		tw := tar.NewWriter(&buf)
-		data := []byte("evil")
-		must(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "../escape.txt", Mode: 0o644, Size: int64(len(data))}))
-		_, err := tw.Write(data)
-		must(t, err)
-		must(t, tw.Close())
-
-		dir := t.TempDir()
-		if err := extractTar(&buf, dir); err == nil {
-			t.Error("expected error for path traversal entry, got nil")
-		}
-	})
-
-	t.Run("parent directories are created implicitly", func(t *testing.T) {
-		var buf bytes.Buffer
-		tw := tar.NewWriter(&buf)
-		// No explicit directory entry — parent must be created by the worker.
-		data := []byte("nested")
-		must(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "a/b/c/file.txt", Mode: 0o644, Size: int64(len(data))}))
-		_, err := tw.Write(data)
-		must(t, err)
-		must(t, tw.Close())
-
-		dir := t.TempDir()
-		must(t, extractTar(&buf, dir))
-
-		got, err := os.ReadFile(filepath.Join(dir, "a", "b", "c", "file.txt"))
-		if err != nil {
-			t.Fatalf("read nested file: %v", err)
-		}
-		if string(got) != "nested" {
-			t.Errorf("content = %q, want %q", string(got), "nested")
-		}
-	})
-}
-
 // ─── Round-trip archive test ─────────────────────────────────────────────────
 
 // TestTarZstdRoundTrip verifies that createTarZstd → extractTarZstd preserves
@@ -719,81 +604,11 @@ func TestTarZstdSymlinkDereference(t *testing.T) {
 	}
 }
 
-// ─── extractTar parallelism benchmarks ──────────────────────────────────────
-
-// BenchmarkExtractTarParallelism sweeps over worker counts and two realistic
-// Gradle cache profiles (many small files, fewer larger files) so you can see
-// where the parallel write pool stops helping on the current machine.
-//
-// Run with:
-//
-//	go test -run='^$' -bench=BenchmarkExtractTarParallelism -benchtime=3s -count=3
-func BenchmarkExtractTarParallelism(b *testing.B) {
-	profiles := []struct {
-		name      string
-		fileCount int
-		fileSize  int
-	}{
-		{"100x1KB", 100, 1 << 10},
-		{"1000x1KB", 1000, 1 << 10},
-		{"100x64KB", 100, 64 << 10},
-		{"1000x64KB", 1000, 64 << 10},
-	}
-
-	workerCounts := []int{1, 2, 4, 8, 16, 32, 64}
-
-	for _, p := range profiles {
-		// Build the tar archive once; reuse it for every sub-benchmark.
-		tarData := makeBenchTar(b, p.fileCount, p.fileSize)
-
-		for _, n := range workerCounts {
-			b.Run(fmt.Sprintf("%s/workers=%d", p.name, n), func(b *testing.B) {
-				b.SetBytes(int64(p.fileCount * p.fileSize))
-				b.ResetTimer()
-				for range b.N {
-					dir := b.TempDir()
-					if err := extractTarN(bytes.NewReader(tarData), dir, n); err != nil {
-						b.Fatal(err)
-					}
-				}
-			})
-		}
-	}
-}
-
-// makeBenchTar builds an in-memory tar archive with count files of the given size.
-func makeBenchTar(b *testing.B, count, size int) []byte {
-	b.Helper()
-	payload := bytes.Repeat([]byte("x"), size)
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	for i := range count {
-		name := fmt.Sprintf("file%04d.bin", i)
-		must2(b, tw.WriteHeader(&tar.Header{
-			Typeflag: tar.TypeReg,
-			Name:     name,
-			Mode:     0o644,
-			Size:     int64(size),
-		}))
-		_, err := tw.Write(payload)
-		must2(b, err)
-	}
-	must2(b, tw.Close())
-	return buf.Bytes()
-}
-
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 func must(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
 		t.Fatal(err)
-	}
-}
-
-func must2(b *testing.B, err error) {
-	b.Helper()
-	if err != nil {
-		b.Fatal(err)
 	}
 }

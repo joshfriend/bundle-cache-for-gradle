@@ -18,6 +18,7 @@ linters:
         - G703  # path traversal taint — credentials path comes from env var or ~/.aws
         - G704  # SSRF taint analysis — S3 endpoint is user-configured; IMDS URL is a fixed constant
         - G706  # log injection taint — all logged values are computed from arithmetic, not user input
+        - G115  # integer overflow uintptr→int — file descriptors are always small non-negative ints
 
 formatters:
   enable:

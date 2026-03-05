@@ -12,7 +12,6 @@
 package main
 
 import (
-	"archive/tar"
 	"bufio"
 	"bytes"
 	"context"
@@ -449,27 +448,27 @@ func zstdDecompressCmd(ctx context.Context) *exec.Cmd {
 	return exec.CommandContext(ctx, "zstd", "-dc", "-T"+n) //nolint:gosec
 }
 
-// extractTarZstd decompresses a zstd-compressed tar stream from r into dir.
-// Uses pzstd when available for parallel frame decompression (matching the
-// parallel compression used on the save path); falls back to zstd -dc -T0.
-// File writes are dispatched to a worker pool so NVMe IOPS can be exploited.
+// extractTarZstd decompresses a zstd-compressed tar archive from r into dir.
+// pzstd/zstd decompresses in parallel; the resulting tar stream is extracted
+// by extractTarGo (pooled-buffer parallel writer) or piped to system tar as
+// a fallback when building without CGO on platforms where tar is unavailable.
 func extractTarZstd(ctx context.Context, r io.Reader, dir string) error {
 	zstdCmd := zstdDecompressCmd(ctx)
 	zstdCmd.Stdin = r
+
+	var zstdStderr bytes.Buffer
+	zstdCmd.Stderr = &zstdStderr
 
 	zstdOut, err := zstdCmd.StdoutPipe()
 	if err != nil {
 		return errors.Wrap(err, "zstd stdout pipe")
 	}
 
-	var zstdStderr bytes.Buffer
-	zstdCmd.Stderr = &zstdStderr
-
 	if err := zstdCmd.Start(); err != nil {
 		return errors.Wrap(err, "start zstd")
 	}
 
-	extractErr := extractTar(zstdOut, dir)
+	extractErr := extractTarPlatform(zstdOut, dir)
 	zstdErr := zstdCmd.Wait()
 
 	var errs []error
@@ -482,105 +481,15 @@ func extractTarZstd(ctx context.Context, r io.Reader, dir string) error {
 	return errors.Join(errs...)
 }
 
-// extractTar reads a tar stream from r and extracts it into dir.
-// Directories and symlinks are created on the calling goroutine; regular file
-// writes are dispatched to a worker pool (one worker per logical CPU) so that
-// many small files can be flushed to disk concurrently.
-func extractTar(r io.Reader, dir string) error {
-	// File writes are I/O bound. Benchmarks show the sweet spot is ~1×CPU;
-	// 16 is a floor for machines with few cores where 1×CPU underutilizes IOPS.
-	return extractTarN(r, dir, max(16, runtime.NumCPU()))
-}
-
-func extractTarN(r io.Reader, dir string, numWorkers int) error {
-	type fileJob struct {
-		path string
-		mode os.FileMode
-		data []byte
-	}
-
-	jobs := make(chan fileJob, numWorkers*2)
-
-	var (
-		workerErrs []error
-		mu         sync.Mutex
-	)
-
-	var wg sync.WaitGroup
-	for range numWorkers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for job := range jobs {
-				if err := os.MkdirAll(filepath.Dir(job.path), 0o750); err != nil {
-					mu.Lock()
-					workerErrs = append(workerErrs, errors.Errorf("create parent of %s: %w", job.path, err))
-					mu.Unlock()
-					continue
-				}
-				if err := os.WriteFile(job.path, job.data, job.mode); err != nil {
-					mu.Lock()
-					workerErrs = append(workerErrs, errors.Errorf("write %s: %w", job.path, err))
-					mu.Unlock()
-				}
-			}
-		}()
-	}
-
-	tr := tar.NewReader(r)
-	cleanDir := filepath.Clean(dir) + string(os.PathSeparator)
-	var readErr error
-readLoop:
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			readErr = errors.Wrap(err, "read tar entry")
-			break
-		}
-
-		target := filepath.Join(dir, hdr.Name)
-		if !strings.HasPrefix(filepath.Clean(target)+string(os.PathSeparator), cleanDir) {
-			readErr = errors.Errorf("tar entry %q escapes destination directory", hdr.Name)
-			break
-		}
-
-		switch hdr.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, hdr.FileInfo().Mode()); err != nil {
-				readErr = errors.Errorf("mkdir %s: %w", hdr.Name, err)
-				break readLoop
-			}
-		case tar.TypeReg:
-			data, err := io.ReadAll(tr)
-			if err != nil {
-				readErr = errors.Errorf("read %s: %w", hdr.Name, err)
-				break readLoop
-			}
-			jobs <- fileJob{path: target, mode: hdr.FileInfo().Mode(), data: data}
-		case tar.TypeSymlink:
-			if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
-				readErr = errors.Errorf("mkdir for symlink %s: %w", hdr.Name, err)
-				break readLoop
-			}
-			if err := os.Symlink(hdr.Linkname, target); err != nil {
-				readErr = errors.Errorf("symlink %s → %s: %w", hdr.Name, hdr.Linkname, err)
-				break readLoop
-			}
-		}
-	}
-
-	close(jobs)
-	wg.Wait()
-
-	var allErrs []error
-	if readErr != nil {
-		allErrs = append(allErrs, readErr)
-	}
-	allErrs = append(allErrs, workerErrs...)
-	return errors.Join(allErrs...)
+// extractBufPool is a pool of reusable byte-slice pointers shared by all
+// platform extractors. Reusing slices eliminates per-file heap allocations and
+// the GC pressure they cause. Initial capacity is 256 KiB — large enough for
+// most Gradle cache files without needing a separate allocation.
+var extractBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, 256<<10)
+		return &b
+	},
 }
 
 // zstdCompressCmd returns the command for zstd compression.
