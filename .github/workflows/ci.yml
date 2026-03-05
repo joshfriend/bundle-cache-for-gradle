@@ -47,10 +47,13 @@ jobs:
       - name: Activate Hermit
         run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
 
-      - name: Build all platforms
-        run: just build-all
+      - name: Build all platforms and fat binary
+        run: just build-fat
+
+      - name: Build macOS universal binary
+        run: just build-universal
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/gradle-cache-*
+          files: dist/gradle-cache*
