@@ -430,6 +430,33 @@ func (c *s3Client) objectURL(bucket, key string) string {
 	return sb.String()
 }
 
+// canonQueryString builds the AWS SigV4 canonical query string from rawQuery.
+// Unlike req.URL.RawQuery (which may omit the "=" for valueless params like
+// "?uploads"), this function always emits "key=" for empty values, percent-
+// encodes with %XX (not "+"), and sorts parameters alphabetically.
+func canonQueryString(rawQuery string) string {
+	if rawQuery == "" {
+		return ""
+	}
+	params, _ := url.ParseQuery(rawQuery)
+	pairs := make([]string, 0, len(params))
+	for k, vs := range params {
+		ek := awsQueryEscape(k)
+		for _, v := range vs {
+			pairs = append(pairs, ek+"="+awsQueryEscape(v))
+		}
+	}
+	sort.Strings(pairs)
+	return strings.Join(pairs, "&")
+}
+
+// awsQueryEscape percent-encodes s per the AWS SigV4 spec: all characters
+// except unreserved (A-Z a-z 0-9 - _ . ~) become %XX with uppercase hex.
+// Unlike url.QueryEscape it never uses "+".
+func awsQueryEscape(s string) string {
+	return strings.ReplaceAll(url.QueryEscape(s), "+", "%20")
+}
+
 // sign adds AWS Signature Version 4 headers to req using UNSIGNED-PAYLOAD,
 // which is permitted for all requests over HTTPS.
 func (c *s3Client) sign(req *http.Request) {
@@ -465,7 +492,7 @@ func (c *s3Client) sign(req *http.Request) {
 
 	canonReq := req.Method + "\n" +
 		req.URL.EscapedPath() + "\n" +
-		req.URL.RawQuery + "\n" +
+		canonQueryString(req.URL.RawQuery) + "\n" +
 		canonHdrs.String() + "\n" +
 		signedNames.String() + "\n" +
 		"UNSIGNED-PAYLOAD"
