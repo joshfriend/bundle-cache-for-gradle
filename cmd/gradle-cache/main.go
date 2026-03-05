@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,8 +29,6 @@ import (
 
 	"github.com/alecthomas/errors"
 	"github.com/alecthomas/kong"
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 type CLI struct {
@@ -76,7 +73,7 @@ func (c *RestoreCmd) AfterApply() error {
 func (c *RestoreCmd) Run(ctx context.Context) error {
 	totalStart := time.Now()
 
-	client, err := newMinioClient(c.Region)
+	client, err := newS3Client(c.Region)
 	if err != nil {
 		return err
 	}
@@ -99,8 +96,7 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 	var hitKey string
 	for _, sha := range commits {
 		key := s3Key(sha, c.CacheKey, bundleFile)
-		_, statErr := client.StatObject(ctx, c.Bucket, key, minio.StatObjectOptions{})
-		if statErr == nil {
+		if err := client.stat(ctx, c.Bucket, key); err == nil {
 			hitKey = key
 			break
 		}
@@ -123,7 +119,7 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 		return errors.Wrap(err, "create temp dir")
 	}
 
-	obj, err := client.GetObject(ctx, c.Bucket, hitKey, minio.GetObjectOptions{})
+	obj, err := client.get(ctx, c.Bucket, hitKey)
 	if err != nil {
 		return errors.Wrap(err, "get object")
 	}
@@ -239,7 +235,7 @@ func (c *SaveCmd) Run(ctx context.Context) error {
 		return errors.Errorf("caches directory not found at %s: %w", cachesDir, err)
 	}
 
-	client, err := newMinioClient(c.Region)
+	client, err := newS3Client(c.Region)
 	if err != nil {
 		return err
 	}
@@ -248,7 +244,7 @@ func (c *SaveCmd) Run(ctx context.Context) error {
 	key := s3Key(c.Commit, c.CacheKey, bundleFile)
 
 	// Skip upload if bundle already exists.
-	if _, err := client.StatObject(ctx, c.Bucket, key, minio.StatObjectOptions{}); err == nil {
+	if err := client.stat(ctx, c.Bucket, key); err == nil {
 		slog.Info("bundle already exists", "key", key)
 		return nil
 	}
@@ -262,26 +258,34 @@ func (c *SaveCmd) Run(ctx context.Context) error {
 	sources := []tarSource{{BaseDir: c.GradleUserHome, Path: "./caches"}}
 	sources = append(sources, projectDirSources(projectDir, c.IncludedBuilds)...)
 
+	// Buffer the bundle to a temp file so we have a known Content-Length for
+	// the S3 PUT (required for single-part upload).
+	tmp, err := os.CreateTemp("", "gradle-cache-bundle-*")
+	if err != nil {
+		return errors.Wrap(err, "create temp file")
+	}
+	defer func() {
+		tmp.Close()           //nolint:errcheck
+		os.Remove(tmp.Name()) //nolint:errcheck
+	}()
+
 	slog.Info("saving bundle", "key", key)
 	saveStart := time.Now()
 
-	pr, pw := io.Pipe()
-	errCh := make(chan error, 1)
-
-	go func() {
-		defer pw.Close() //nolint:errcheck
-		errCh <- createTarZstd(ctx, pw, sources)
-	}()
-
-	_, err = client.PutObject(ctx, c.Bucket, key, pr, -1, minio.PutObjectOptions{
-		ContentType: "application/zstd",
-	})
-	if err != nil {
-		return errors.Wrap(err, "upload bundle")
+	if err := createTarZstd(ctx, tmp, sources); err != nil {
+		return errors.Wrap(err, "create bundle archive")
 	}
 
-	if err := <-errCh; err != nil {
-		return errors.Wrap(err, "create bundle archive")
+	size, err := tmp.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return errors.Wrap(err, "seek bundle")
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return errors.Wrap(err, "rewind bundle")
+	}
+
+	if err := client.put(ctx, c.Bucket, key, tmp, size, "application/zstd"); err != nil {
+		return errors.Wrap(err, "upload bundle")
 	}
 
 	slog.Debug("archive+upload complete", "duration", time.Since(saveStart))
@@ -359,48 +363,6 @@ func s3Key(commit, cacheKey, bundleFile string) string {
 type tarSource struct {
 	BaseDir string
 	Path    string
-}
-
-// newMinioClient builds a minio client using the standard AWS credential chain,
-// with IRSA (Kubernetes service account token) support when the appropriate
-// environment variables are set.
-func newMinioClient(region string) (*minio.Client, error) {
-	var creds *credentials.Credentials
-
-	if tokenFile := os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE"); tokenFile != "" {
-		stsEndpoint := "https://sts." + region + ".amazonaws.com"
-		stsWebID := &credentials.STSWebIdentity{
-			STSEndpoint: stsEndpoint,
-			GetWebIDTokenExpiry: func() (*credentials.WebIdentityToken, error) {
-				token, err := os.ReadFile(tokenFile) //nolint:gosec // tokenFile comes from AWS_WEB_IDENTITY_TOKEN_FILE env var
-				if err != nil {
-					return nil, errors.Wrap(err, "read web identity token")
-				}
-				return &credentials.WebIdentityToken{Token: string(token)}, nil
-			},
-		}
-		creds = credentials.New(stsWebID)
-	} else {
-		transport, err := minio.DefaultTransport(true)
-		if err != nil {
-			return nil, errors.Wrap(err, "create default transport")
-		}
-		creds = credentials.NewChainCredentials([]credentials.Provider{
-			&credentials.EnvAWS{},
-			&credentials.FileAWSCredentials{},
-			&credentials.IAM{Client: &http.Client{Transport: transport}},
-		})
-	}
-
-	client, err := minio.New("s3.amazonaws.com", &minio.Options{
-		Creds:  creds,
-		Secure: true,
-		Region: region,
-	})
-	if err != nil {
-		return nil, errors.Wrap(err, "create minio client")
-	}
-	return client, nil
 }
 
 // historyCommits runs git log from the given ref and returns commit SHAs within
