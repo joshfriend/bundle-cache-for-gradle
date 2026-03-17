@@ -666,7 +666,7 @@ func (c *SaveDeltaCmd) Run(ctx context.Context) error {
 
 // projectDirSources returns tarSource entries for project-specific dirs:
 // configuration-cache (from projectDir/.gradle/) and included build output dirs,
-// for any that exist on disk. The archive paths match bundled-cache-manager.rb.
+// for any that exist on disk.
 func projectDirSources(projectDir string, includedBuilds []string) []tarSource {
 	var sources []tarSource
 
@@ -740,7 +740,7 @@ type tarSource struct {
 }
 
 // historyCommits runs git log from the given ref and returns commit SHAs within
-// maxBlocks distinct-author "blocks" (same algorithm as bundled-cache-manager.rb).
+// maxBlocks distinct-author "blocks".
 func historyCommits(ctx context.Context, gitDir, ref string, maxBlocks int) ([]string, error) {
 	rawCount := maxBlocks * 10
 	//nolint:gosec // ref is a user-supplied git ref, not a shell injection vector
@@ -861,10 +861,10 @@ func zstdCompressCmd(ctx context.Context) *exec.Cmd {
 }
 
 // createTarZstd creates a zstd-compressed tar archive from the given sources and
-// writes it to w. Uses -h to dereference symlinks, matching bundled-cache-manager.rb.
+// writes it to w. Uses -h to dereference symlinks.
 // Multiple sources map to multiple -C baseDir path entries in the tar command,
-// which is how bundled-cache-manager.rb combines caches + configuration-cache +
-// convention build dirs into a single flat archive.
+// which is how we combine caches + configuration-cache + convention build dirs into a single flat
+// archive.
 func createTarZstd(ctx context.Context, w io.Writer, sources []tarSource) error {
 	args := []string{"-chf", "-"}
 	for _, src := range sources {

@@ -2,6 +2,7 @@
 package main
 
 import (
+	archive_tar "archive/tar"
 	"bytes"
 	"context"
 	"fmt"
@@ -286,8 +287,7 @@ func TestExtractBundleRouting(t *testing.T) {
 // ─── Git history walk tests ──────────────────────────────────────────────────
 
 // TestHistoryCommits creates a temporary git repository with a known commit
-// graph and verifies that the author-block counting logic matches the
-// bundled-cache-manager.rb algorithm.
+// graph
 func TestHistoryCommits(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
@@ -468,7 +468,7 @@ func TestTarZstdRoundTrip(t *testing.T) {
 }
 
 // TestTarZstdSymlinkDereference verifies that -h causes symlinked directories
-// to be archived as real content (matching bundled-cache-manager.rb's -h flag).
+// to be archived as real content.
 func TestTarZstdSymlinkDereference(t *testing.T) {
 	if _, err := exec.LookPath("tar"); err != nil {
 		t.Skip("tar not available")
@@ -748,6 +748,248 @@ func BenchmarkDeltaScanReal(b *testing.B) {
 		_ = files
 	}
 	b.ReportMetric(float64(totalFiles), "files/op")
+}
+
+// ─── Extraction benchmark ─────────────────────────────────────────────────────
+
+// BenchmarkExtract measures extractTarPlatformRouted throughput against a
+// synthetic tar archive that mimics the structure and file-size distribution of
+// a real Gradle cache bundle: many small metadata/index files (~1 KB) and a
+// smaller number of large jar files (~500 KB). Routing is exercised by
+// including both caches/ and configuration-cache/ entries.
+//
+// Run with:
+//
+//	go test -bench=BenchmarkExtract -benchtime=3x ./cmd/gradle-cache/
+//
+// Output includes files/op and MB/op so you can derive ns/file and MB/s.
+func BenchmarkExtract(b *testing.B) {
+	for _, tc := range []struct {
+		name       string
+		smallFiles int // ~1 KB each (metadata, index, lock files)
+		largeFiles int // ~512 KB each (jars)
+		includeCC  bool
+	}{
+		{"small_5k", 5_000, 0, false},
+		{"mixed_5k_small_500_large", 5_000, 500, false},
+		{"mixed_with_cc", 5_000, 500, true},
+	} {
+		tc := tc
+		b.Run(tc.name, func(b *testing.B) {
+			// Build the tar in memory once; each iteration re-extracts the same bytes.
+			tarBuf := buildSyntheticTar(b, tc.smallFiles, tc.largeFiles, tc.includeCC)
+			totalBytes := int64(tarBuf.Len())
+
+			destHome := b.TempDir()
+			destProject := b.TempDir()
+
+			rules := []extractRule{
+				{prefix: "caches/", baseDir: destHome},
+				{prefix: "configuration-cache/", baseDir: filepath.Join(destProject, ".gradle")},
+			}
+			targetFn := func(name string) string {
+				for _, rule := range rules {
+					if strings.HasPrefix(name, rule.prefix) {
+						return filepath.Join(rule.baseDir, name)
+					}
+				}
+				return filepath.Join(destProject, name)
+			}
+
+			nFiles := tc.smallFiles + tc.largeFiles
+			if tc.includeCC {
+				nFiles += 10
+			}
+
+			b.SetBytes(totalBytes)
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for range b.N {
+				// Each iteration extracts into a fresh directory so we're not
+				// benchmarking the skipExisting fast-path.
+				iterHome := b.TempDir()
+				iterProject := b.TempDir()
+				iterRules := []extractRule{
+					{prefix: "caches/", baseDir: iterHome},
+					{prefix: "configuration-cache/", baseDir: filepath.Join(iterProject, ".gradle")},
+				}
+				iterFn := func(name string) string {
+					for _, rule := range iterRules {
+						if strings.HasPrefix(name, rule.prefix) {
+							return filepath.Join(rule.baseDir, name)
+						}
+					}
+					return filepath.Join(iterProject, name)
+				}
+				_ = targetFn // suppress unused warning from outer scope
+				if err := extractTarPlatformRouted(bytes.NewReader(tarBuf.Bytes()), iterFn, false); err != nil {
+					b.Fatal(err)
+				}
+			}
+
+			b.ReportMetric(float64(nFiles), "files/op")
+			b.ReportMetric(float64(totalBytes)/1e6, "MB/op")
+		})
+	}
+}
+
+// buildSyntheticTar builds an uncompressed tar archive in memory with
+// smallFiles entries of ~1 KB and largeFiles entries of ~512 KB under caches/,
+// plus 10 configuration-cache entries if includeCC is true. The data is
+// deterministic (repeated 0x42 bytes) so it compresses well but still exercises
+// the full write path.
+func buildSyntheticTar(b *testing.B, smallFiles, largeFiles int, includeCC bool) *bytes.Buffer {
+	b.Helper()
+
+	const smallSize = 1024
+	const largeSize = 512 * 1024
+
+	smallData := bytes.Repeat([]byte{0x42}, smallSize)
+	largeData := bytes.Repeat([]byte{0x55}, largeSize)
+
+	var buf bytes.Buffer
+	tw := archive_tar.NewWriter(&buf)
+
+	writeEntry := func(name string, data []byte) {
+		b.Helper()
+		hdr := &archive_tar.Header{
+			Typeflag: archive_tar.TypeReg,
+			Name:     name,
+			Size:     int64(len(data)),
+			Mode:     0o644,
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			b.Fatalf("write tar header %s: %v", name, err)
+		}
+		if _, err := tw.Write(data); err != nil {
+			b.Fatalf("write tar data %s: %v", name, err)
+		}
+	}
+
+	for i := range smallFiles {
+		writeEntry(fmt.Sprintf("caches/8.14.3/group%d/artifact%d/f%d.index", i%50, i%20, i), smallData)
+	}
+	for i := range largeFiles {
+		writeEntry(fmt.Sprintf("caches/8.14.3/jars-%d/group%d/artifact-%d.jar", i%10, i%30, i), largeData)
+	}
+	if includeCC {
+		for i := range 10 {
+			writeEntry(fmt.Sprintf("configuration-cache/entry-%d/work.bin", i), smallData)
+		}
+	}
+
+	if err := tw.Close(); err != nil {
+		b.Fatalf("close tar: %v", err)
+	}
+	return &buf
+}
+
+// BenchmarkExtractVsSymlink compares the current direct-extraction approach
+// against the old extract-to-tmpDir+symlink approach on the same synthetic
+// bundle. Both sub-benchmarks write identical bytes; the difference is whether
+// extraction targets the final directory directly or a sibling staging dir that
+// is then symlinked into place.
+//
+// Run with:
+//
+//	go test -bench=BenchmarkExtractVsSymlink -benchtime=3x ./cmd/gradle-cache/
+func BenchmarkExtractVsSymlink(b *testing.B) {
+	for _, tc := range []struct {
+		name       string
+		smallFiles int
+		largeFiles int
+		includeCC  bool
+	}{
+		{"small_5k", 5_000, 0, false},
+		{"mixed_5k_small_500_large", 5_000, 500, false},
+		{"mixed_with_cc", 5_000, 500, true},
+	} {
+		tc := tc
+		tarBuf := buildSyntheticTar(b, tc.smallFiles, tc.largeFiles, tc.includeCC)
+		totalBytes := int64(tarBuf.Len())
+		nFiles := tc.smallFiles + tc.largeFiles
+		if tc.includeCC {
+			nFiles += 10
+		}
+
+		// ── direct: extract straight to final destinations ──────────────────
+		b.Run(tc.name+"/direct", func(b *testing.B) {
+			b.SetBytes(totalBytes)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				gradleHome := b.TempDir()
+				projectDir := b.TempDir()
+				rules := []extractRule{
+					{prefix: "caches/", baseDir: gradleHome},
+					{prefix: "configuration-cache/", baseDir: filepath.Join(projectDir, ".gradle")},
+				}
+				targetFn := func(name string) string {
+					for _, rule := range rules {
+						if strings.HasPrefix(name, rule.prefix) {
+							return filepath.Join(rule.baseDir, name)
+						}
+					}
+					return filepath.Join(projectDir, name)
+				}
+				if err := extractTarPlatformRouted(bytes.NewReader(tarBuf.Bytes()), targetFn, false); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(nFiles), "files/op")
+			b.ReportMetric(float64(totalBytes)/1e6, "MB/op")
+		})
+
+		// ── tmp+symlink: extract to sibling staging dir, then symlink ────────
+		// Mirrors the old approach: MkdirTemp alongside gradleHome, extract
+		// everything flat, then os.Symlink(tmpDir/caches, gradleHome/caches)
+		// and os.Symlink(tmpDir/configuration-cache, project/.gradle/cc).
+		b.Run(tc.name+"/tmp_symlink", func(b *testing.B) {
+			b.SetBytes(totalBytes)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				gradleHome := b.TempDir()
+				projectDir := b.TempDir()
+
+				// Stage into a sibling of gradleHome (same filesystem → rename/symlink is instant).
+				tmpDir, err := os.MkdirTemp(filepath.Dir(gradleHome), "gradle-cache-bench-*")
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				if err := extractTarPlatform(bytes.NewReader(tarBuf.Bytes()), tmpDir); err != nil {
+					os.RemoveAll(tmpDir) //nolint:errcheck
+					b.Fatal(err)
+				}
+
+				// Symlink caches/ into gradleHome.
+				if err := os.Symlink(filepath.Join(tmpDir, "caches"), filepath.Join(gradleHome, "caches")); err != nil {
+					os.RemoveAll(tmpDir) //nolint:errcheck
+					b.Fatal(err)
+				}
+
+				// Symlink configuration-cache/ into project/.gradle/.
+				if tc.includeCC {
+					if err := os.MkdirAll(filepath.Join(projectDir, ".gradle"), 0o750); err != nil {
+						os.RemoveAll(tmpDir) //nolint:errcheck
+						b.Fatal(err)
+					}
+					if err := os.Symlink(
+						filepath.Join(tmpDir, "configuration-cache"),
+						filepath.Join(projectDir, ".gradle", "configuration-cache"),
+					); err != nil {
+						os.RemoveAll(tmpDir) //nolint:errcheck
+						b.Fatal(err)
+					}
+				}
+				// Leave tmpDir in place — symlinks point into it, same as old behaviour.
+			}
+			b.ReportMetric(float64(nFiles), "files/op")
+			b.ReportMetric(float64(totalBytes)/1e6, "MB/op")
+		})
+	}
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
