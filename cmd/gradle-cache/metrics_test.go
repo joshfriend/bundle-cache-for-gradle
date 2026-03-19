@@ -67,10 +67,12 @@ func TestStatsdClientGauge(t *testing.T) {
 	}
 }
 
-func TestEmitHelperNilSafe(t *testing.T) {
-	// Should not panic when metrics is nil.
-	emitTiming(nil, "test.metric", 100)
-	emitGauge(nil, "test.metric", 200)
+func TestNoopMetrics(t *testing.T) {
+	// noopMetrics should not panic.
+	var m metricsClient = noopMetrics{}
+	emitTiming(m, "test.metric", 100)
+	emitGauge(m, "test.metric", 200)
+	m.close()
 }
 
 func TestMetricsFlagsNoneConfigured(t *testing.T) {
@@ -78,9 +80,6 @@ func TestMetricsFlagsNoneConfigured(t *testing.T) {
 	t.Setenv("DD_AGENT_HOST", "")
 	f := &metricsFlags{}
 	m := f.newMetricsClient()
-	// May be non-nil if a local DD agent happens to be running — that's fine.
-	// Just verify it doesn't panic.
-	if m != nil {
-		m.close()
-	}
+	// Should always return a non-nil client (noopMetrics when no backend configured).
+	m.close()
 }

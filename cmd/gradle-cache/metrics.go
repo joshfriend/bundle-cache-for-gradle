@@ -22,6 +22,14 @@ type metricsClient interface {
 	close()
 }
 
+// noopMetrics is a no-op metricsClient used when no backend is configured.
+// It exists because kong cannot bind a nil interface value.
+type noopMetrics struct{}
+
+func (noopMetrics) timing(string, int64, ...string) {}
+func (noopMetrics) gauge(string, int64, ...string)  {}
+func (noopMetrics) close()                          {}
+
 // metricsFlags are CLI flags for configuring metrics emission.
 type metricsFlags struct {
 	StatsdAddr    string   `help:"DogStatsD address (host:port) for emitting metrics. Auto-detected from DD_AGENT_HOST if not set."`
@@ -45,14 +53,14 @@ func detectStatsdAddr() string {
 
 // newMetricsClient returns a metricsClient based on the configured flags.
 // If no explicit backend is configured, auto-detects a local DD agent.
-// Returns nil if no metrics backend is available.
+// Returns a no-op client if no metrics backend is available.
 func (f *metricsFlags) newMetricsClient() metricsClient {
 	if f.StatsdAddr != "" {
 		if c := newStatsdClient(f.StatsdAddr, f.MetricsTags); c != nil {
 			return c
 		}
 		slog.Warn("failed to connect to DogStatsD, metrics disabled", "addr", f.StatsdAddr)
-		return nil
+		return noopMetrics{}
 	}
 	if f.DatadogAPIKey != "" {
 		return newDatadogAPIClient(f.DatadogAPIKey, f.MetricsTags)
@@ -64,7 +72,7 @@ func (f *metricsFlags) newMetricsClient() metricsClient {
 			return c
 		}
 	}
-	return nil
+	return noopMetrics{}
 }
 
 // ── DogStatsD (UDP) ─────────────────────────────────────────────────────────
@@ -169,16 +177,10 @@ func (d *datadogAPIClient) submit(name string, value float64, metricType string,
 
 func (d *datadogAPIClient) close() {}
 
-// emitTiming sends a timing metric if m is non-nil.
 func emitTiming(m metricsClient, name string, ms int64, tags ...string) {
-	if m != nil {
-		m.timing(name, ms, tags...)
-	}
+	m.timing(name, ms, tags...)
 }
 
-// emitGauge sends a gauge metric if m is non-nil.
 func emitGauge(m metricsClient, name string, value int64, tags ...string) {
-	if m != nil {
-		m.gauge(name, value, tags...)
-	}
+	m.gauge(name, value, tags...)
 }

@@ -713,11 +713,10 @@ func main() {
 	setupLogger(cli.LogLevel)
 
 	metrics := cli.newMetricsClient()
-	if metrics != nil {
-		defer metrics.close()
-	}
+	defer metrics.close()
 
-	kctx.FatalIfErrorf(kctx.Run(ctx, metrics))
+	kctx.BindTo(metrics, (*metricsClient)(nil))
+	kctx.FatalIfErrorf(kctx.Run(ctx))
 }
 
 // setupLogger configures the global slog logger at the requested level.
