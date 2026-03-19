@@ -16,6 +16,36 @@ import (
 
 // ─── Pure unit tests ────────────────────────────────────────────────────────
 
+func TestIsExcludedCache(t *testing.T) {
+	excluded := []string{
+		"daemon",
+		".tmp",
+		"gc.properties",
+		"cc-keystore",
+		"foo.lock",
+		"gradle-cache.lock",
+	}
+	for _, name := range excluded {
+		if !isExcludedCache(name) {
+			t.Errorf("expected %q to be excluded", name)
+		}
+	}
+
+	allowed := []string{
+		"modules-2",
+		"transforms-4",
+		"wrapper",
+		"caches",
+		"foo.jar",
+		"build.gradle.kts",
+	}
+	for _, name := range allowed {
+		if isExcludedCache(name) {
+			t.Errorf("expected %q to NOT be excluded", name)
+		}
+	}
+}
+
 func TestBundleFilename(t *testing.T) {
 	tests := []struct {
 		cacheKey string
@@ -428,6 +458,9 @@ func TestTarZstdRoundTrip(t *testing.T) {
 	gradleHome := filepath.Join(srcDir, "gradle-home")
 	must(t, os.MkdirAll(filepath.Join(gradleHome, "caches", "modules"), 0o755))
 	must(t, os.WriteFile(filepath.Join(gradleHome, "caches", "modules", "entry.bin"), []byte("gradle data"), 0o644))
+	// cc-keystore should be excluded
+	must(t, os.MkdirAll(filepath.Join(gradleHome, "caches", "8.14.3", "cc-keystore"), 0o755))
+	must(t, os.WriteFile(filepath.Join(gradleHome, "caches", "8.14.3", "cc-keystore", "keystore.bin"), []byte("secret"), 0o644))
 
 	// wrapper/ source (under gradle-home) — includes a .zip that should be excluded
 	must(t, os.MkdirAll(filepath.Join(gradleHome, "wrapper", "dists", "gradle-8.14.3-bin", "abc123"), 0o755))
@@ -470,10 +503,14 @@ func TestTarZstdRoundTrip(t *testing.T) {
 		}
 	}
 
-	// Verify wrapper zip was excluded from the archive.
-	excludedZip := filepath.Join(dstDir, "wrapper/dists/gradle-8.14.3-bin/abc123/gradle-8.14.3-bin.zip")
-	if _, err := os.Stat(excludedZip); err == nil {
-		t.Error("wrapper zip should have been excluded from archive")
+	// Verify excluded files are absent from the archive.
+	for _, rel := range []string{
+		"wrapper/dists/gradle-8.14.3-bin/abc123/gradle-8.14.3-bin.zip",
+		"caches/8.14.3/cc-keystore/keystore.bin",
+	} {
+		if _, err := os.Stat(filepath.Join(dstDir, rel)); err == nil {
+			t.Errorf("%s should have been excluded from archive", rel)
+		}
 	}
 
 	// Verify file contents round-trip correctly.

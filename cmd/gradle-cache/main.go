@@ -891,6 +891,18 @@ var cacheExclusions = []string{
 	".tmp",
 	"gc.properties",
 	"*.lock",
+
+	// cc-keystore is the configuration cache encryption keystore, generated
+	// per-machine from the GRADLE_ENCRYPTION_KEY environment variable. It must
+	// not be cached because it is tied to the specific key used to create it —
+	// restoring it on a worker with a different (or missing) key causes Gradle
+	// to fail when reading the configuration cache.
+	//
+	// To use configuration cache encryption in CI, set GRADLE_ENCRYPTION_KEY to
+	// a stable secret value in the build environment rather than relying on the
+	// keystore file. Gradle will regenerate the keystore automatically from the
+	// environment variable on each worker.
+	"cc-keystore",
 }
 
 // wrapperZipExclusion is a path-based tar --exclude pattern that removes
