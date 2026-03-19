@@ -247,12 +247,14 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 
 	// Route tar entries to their final destinations directly:
 	//   ./caches/...               → GRADLE_USER_HOME/caches/...
+	//   ./wrapper/...              → GRADLE_USER_HOME/wrapper/...
 	//   ./configuration-cache/...  → <project>/.gradle/configuration-cache/...
 	//   everything else            → <project>/...  (buildSrc/build, plugins/*/build, …)
 	// Existing files are left untouched (skipExisting=true) so a partial
 	// pre-existing cache is merged rather than overwritten.
 	rules := []extractRule{
 		{prefix: "caches/", baseDir: c.GradleUserHome},
+		{prefix: "wrapper/", baseDir: c.GradleUserHome},
 		{prefix: "configuration-cache/", baseDir: filepath.Join(projectDir, ".gradle")},
 	}
 
@@ -507,13 +509,16 @@ func (c *SaveCmd) Run(ctx context.Context) error {
 		return nil
 	}
 
-	// Build the list of tar sources: always include caches, plus any
-	// configuration-cache and convention build dirs in the current directory.
+	// Build the list of tar sources: always include caches, plus wrapper
+	// (if present), configuration-cache and convention build dirs.
 	projectDir, err := os.Getwd()
 	if err != nil {
 		return errors.Wrap(err, "get working directory")
 	}
 	sources := []tarSource{{BaseDir: c.GradleUserHome, Path: "./caches"}}
+	if fi, err := os.Stat(filepath.Join(c.GradleUserHome, "wrapper")); err == nil && fi.IsDir() {
+		sources = append(sources, tarSource{BaseDir: c.GradleUserHome, Path: "./wrapper"})
+	}
 	sources = append(sources, projectDirSources(projectDir, c.IncludedBuilds)...)
 
 	// Buffer the bundle to a temp file so we have a known Content-Length for upload.

@@ -242,6 +242,7 @@ func TestExtractBundleRouting(t *testing.T) {
 
 	rules := []extractRule{
 		{prefix: "caches/", baseDir: gradleHome},
+		{prefix: "wrapper/", baseDir: gradleHome},
 		{prefix: "configuration-cache/", baseDir: filepath.Join(projectDir, ".gradle")},
 	}
 
@@ -261,6 +262,10 @@ func TestExtractBundleRouting(t *testing.T) {
 		{
 			entry: "caches/8.14.3/foo.jar",
 			want:  filepath.Join(gradleHome, "caches/8.14.3/foo.jar"),
+		},
+		{
+			entry: "wrapper/dists/gradle-8.14.3-bin/abc123/gradle-8.14.3/lib/gradle-core.jar",
+			want:  filepath.Join(gradleHome, "wrapper/dists/gradle-8.14.3-bin/abc123/gradle-8.14.3/lib/gradle-core.jar"),
 		},
 		{
 			entry: "configuration-cache/abc/entry",
@@ -424,6 +429,10 @@ func TestTarZstdRoundTrip(t *testing.T) {
 	must(t, os.MkdirAll(filepath.Join(gradleHome, "caches", "modules"), 0o755))
 	must(t, os.WriteFile(filepath.Join(gradleHome, "caches", "modules", "entry.bin"), []byte("gradle data"), 0o644))
 
+	// wrapper/ source (under gradle-home)
+	must(t, os.MkdirAll(filepath.Join(gradleHome, "wrapper", "dists", "gradle-8.14.3-bin"), 0o755))
+	must(t, os.WriteFile(filepath.Join(gradleHome, "wrapper", "dists", "gradle-8.14.3-bin", "gradle-core.jar"), []byte("wrapper data"), 0o644))
+
 	// configuration-cache/ source (under .gradle/ inside project)
 	gradleDir := filepath.Join(srcDir, "project", ".gradle")
 	must(t, os.MkdirAll(filepath.Join(gradleDir, "configuration-cache"), 0o755))
@@ -431,6 +440,7 @@ func TestTarZstdRoundTrip(t *testing.T) {
 
 	sources := []tarSource{
 		{BaseDir: gradleHome, Path: "./caches"},
+		{BaseDir: gradleHome, Path: "./wrapper"},
 		{BaseDir: gradleDir, Path: "./configuration-cache"},
 	}
 
@@ -449,6 +459,7 @@ func TestTarZstdRoundTrip(t *testing.T) {
 	// Verify both source trees are present at the bundle root level.
 	for _, rel := range []string{
 		"caches/modules/entry.bin",
+		"wrapper/dists/gradle-8.14.3-bin/gradle-core.jar",
 		"configuration-cache/hash.bin",
 	} {
 		path := filepath.Join(dstDir, rel)
