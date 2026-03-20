@@ -1,9 +1,10 @@
-//nolint:gosec // test file: paths and subprocess args are controlled inputs
+//nolint:gosec // test file: all paths and subprocess args are controlled inputs
 package main
 
 import (
-	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,37 +12,59 @@ import (
 	"testing"
 )
 
-// fileBundleStore is a file-system-backed bundleStore for integration tests.
-type fileBundleStore struct {
-	dir string
+// fakeCachew is a minimal file-backed implementation of the cachew object API
+// used to exercise the real CLI binary without needing S3 or a remote server.
+// Blobs are written to disk to handle large bundles without blowing up memory.
+type fakeCachew struct {
+	dir string // storage directory
 }
 
-func (f *fileBundleStore) path(commit, cacheKey string) string {
-	return filepath.Join(f.dir, commit, bundleFilename(cacheKey))
+func newFakeCachew(dir string) *fakeCachew {
+	return &fakeCachew{dir: dir}
 }
 
-func (f *fileBundleStore) stat(_ context.Context, commit, cacheKey string) (int64, error) {
-	fi, err := os.Stat(f.path(commit, cacheKey))
-	if err != nil {
-		return 0, err
+func (f *fakeCachew) blobPath(key string) string {
+	// key is "cacheKey/commit" — flatten slashes to avoid nested dirs
+	return filepath.Join(f.dir, strings.ReplaceAll(key, "/", "_"))
+}
+
+func (f *fakeCachew) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Expected path: /api/v1/object/{cacheKey}/{commit}
+	key := strings.TrimPrefix(r.URL.Path, "/api/v1/object/")
+	path := f.blobPath(key)
+
+	switch r.Method {
+	case http.MethodHead:
+		if _, err := os.Stat(path); err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	case http.MethodGet:
+		file, err := os.Open(path)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		defer func() { _ = file.Close() }()
+		w.Header().Set("Content-Type", "application/zstd")
+		_, _ = io.Copy(w, file)
+	case http.MethodPost:
+		file, err := os.Create(path)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		_, cpErr := io.Copy(file, r.Body)
+		_ = file.Close()
+		if cpErr != nil {
+			http.Error(w, cpErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
-	return fi.Size(), nil
-}
-
-func (f *fileBundleStore) get(_ context.Context, commit, cacheKey string, _ int64) (io.ReadCloser, error) {
-	return os.Open(f.path(commit, cacheKey))
-}
-
-func (f *fileBundleStore) put(_ context.Context, commit, cacheKey string, r io.ReadSeeker, _ int64) error {
-	p := f.path(commit, cacheKey)
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return err
-	}
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(p, data, 0o644)
 }
 
 // copyDir recursively copies src to dst, preserving file modes.
@@ -63,12 +86,11 @@ func copyDir(dst, src string) error {
 	})
 }
 
-// TestIntegrationGradleBuildCycle exercises the full save/restore cycle with a
-// real Gradle build. It verifies that after restoring a saved cache, the
-// configuration cache reports a hit and build tasks are UP-TO-DATE.
+// TestIntegrationGradleBuildCycle exercises the full save/restore cycle using
+// the compiled CLI binary as a subprocess. This tests the complete code path
+// including kong CLI parsing, metrics binding, and backend communication.
 //
-// The test uses a committed fixture project in testdata/gradle-project rather
-// than generating Gradle files from Go.
+// A fake cachew HTTP server stands in for real storage.
 //
 // Requirements: Java on PATH, internet access (first run downloads Gradle wrapper).
 // Skipped automatically if Java is not available or in -short mode.
@@ -82,9 +104,19 @@ func TestIntegrationGradleBuildCycle(t *testing.T) {
 		}
 	}
 
-	ctx := context.Background()
+	// ── Build the CLI binary ─────────────────────────────────────────────────
+	binaryPath := filepath.Join(t.TempDir(), "gradle-cache")
+	buildCmd := exec.Command("go", "build", "-o", binaryPath, ".")
+	buildCmd.Dir = "."
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
 
-	// Copy the fixture project into a temp dir so we can mutate it freely.
+	// ── Start fake cachew server ─────────────────────────────────────────────
+	server := httptest.NewServer(newFakeCachew(t.TempDir()))
+	defer server.Close()
+
+	// ── Copy the fixture project ─────────────────────────────────────────────
 	fixtureDir := filepath.Join("testdata", "gradle-project")
 	if _, err := os.Stat(fixtureDir); err != nil {
 		t.Fatalf("fixture not found: %v", err)
@@ -101,10 +133,25 @@ func TestIntegrationGradleBuildCycle(t *testing.T) {
 	gradlew := filepath.Join(projectDir, "gradlew")
 	must(t, os.Chmod(gradlew, 0o755))
 
-	// ── Initialize git repo (needed for commit-based cache keys) ─────────────
+	cacheKey := "cache-test:build"
+
+	// Helper to run the gradle-cache CLI.
+	runTool := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command(binaryPath, args...)
+		cmd.Dir = projectDir
+		cmd.Env = gradleEnv(gradleUserHome)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("gradle-cache %v: %v\n%s", args, err, out)
+		}
+		return string(out)
+	}
+
+	// ── Initialize git repo ──────────────────────────────────────────────────
 	gitRun := func(args ...string) string {
 		t.Helper()
-		cmd := exec.CommandContext(ctx, "git", append([]string{"-C", projectDir}, args...)...)
+		cmd := exec.Command("git", append([]string{"-C", projectDir}, args...)...)
 		cmd.Env = append(os.Environ(),
 			"GIT_AUTHOR_NAME=Test",
 			"GIT_AUTHOR_EMAIL=test@test.com",
@@ -125,49 +172,21 @@ func TestIntegrationGradleBuildCycle(t *testing.T) {
 
 	// ── Step 1: Initial Gradle build ─────────────────────────────────────────
 	t.Log("Step 1: Running initial Gradle build...")
-	gradleRun(t, ctx, gradlew, projectDir, gradleUserHome, "build")
+	gradleRun(t, projectDir, gradlew, gradleUserHome, "build")
 
-	// Verify compilation produced class files.
 	classesDir := filepath.Join(projectDir, "build", "classes")
 	if _, err := os.Stat(classesDir); err != nil {
 		t.Fatalf("expected compiled classes: %v", err)
 	}
 
-	// ── Step 2: Save the cache ───────────────────────────────────────────────
-	t.Log("Step 2: Saving cache...")
-	store := &fileBundleStore{dir: t.TempDir()}
-	cacheKey := "cache-test:build"
-
-	sources := []tarSource{{BaseDir: gradleUserHome, Path: "./caches"}}
-	if fi, err := os.Stat(filepath.Join(gradleUserHome, "wrapper")); err == nil && fi.IsDir() {
-		sources = append(sources, tarSource{BaseDir: gradleUserHome, Path: "./wrapper"})
-	}
-	if fi, err := os.Stat(filepath.Join(projectDir, ".gradle", "configuration-cache")); err == nil && fi.IsDir() {
-		sources = append(sources, tarSource{
-			BaseDir: filepath.Join(projectDir, ".gradle"),
-			Path:    "./configuration-cache",
-		})
-	}
-
-	tmp, err := os.CreateTemp("", "gradle-cache-test-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = os.Remove(tmp.Name()) }()
-
-	if err := createTarZstd(ctx, tmp, sources); err != nil {
-		t.Fatalf("createTarZstd: %v", err)
-	}
-	size, _ := tmp.Seek(0, io.SeekCurrent)
-	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("  Bundle size: %.1f MB", float64(size)/1e6)
-
-	if err := store.put(ctx, commitSHA, cacheKey, tmp, size); err != nil {
-		t.Fatalf("store.put: %v", err)
-	}
-	_ = tmp.Close()
+	// ── Step 2: Save the cache via CLI ───────────────────────────────────────
+	t.Log("Step 2: Saving cache via CLI...")
+	runTool("--log-level", "debug", "save",
+		"--cachew-url", server.URL,
+		"--cache-key", cacheKey,
+		"--commit", commitSHA,
+		"--gradle-user-home", gradleUserHome,
+	)
 
 	// ── Step 3: Clear all Gradle state ───────────────────────────────────────
 	t.Log("Step 3: Clearing Gradle state...")
@@ -180,40 +199,31 @@ func TestIntegrationGradleBuildCycle(t *testing.T) {
 		t.Fatal("expected caches dir to be gone after cleanup")
 	}
 
-	// ── Step 4: Restore the cache ────────────────────────────────────────────
-	t.Log("Step 4: Restoring cache...")
-	body, err := store.get(ctx, commitSHA, cacheKey, 0)
-	if err != nil {
-		t.Fatalf("store.get: %v", err)
-	}
-
-	rules := []extractRule{
-		{prefix: "caches/", baseDir: gradleUserHome},
-		{prefix: "wrapper/", baseDir: gradleUserHome},
-		{prefix: "configuration-cache/", baseDir: filepath.Join(projectDir, ".gradle")},
-	}
-	if err := extractBundleZstd(ctx, body, rules, projectDir); err != nil {
-		t.Fatalf("extractBundleZstd: %v", err)
-	}
-	_ = body.Close()
+	// ── Step 4: Restore the cache via CLI ────────────────────────────────────
+	t.Log("Step 4: Restoring cache via CLI...")
+	runTool("--log-level", "debug", "restore",
+		"--cachew-url", server.URL,
+		"--cache-key", cacheKey,
+		"--ref", commitSHA,
+		"--git-dir", projectDir,
+		"--gradle-user-home", gradleUserHome,
+	)
 
 	if _, err := os.Stat(filepath.Join(gradleUserHome, "caches")); err != nil {
 		t.Fatalf("expected caches dir after restore: %v", err)
 	}
 
-	// Check if configuration-cache was restored.
 	ccRestored := filepath.Join(projectDir, ".gradle", "configuration-cache")
 	if _, err := os.Stat(ccRestored); err != nil {
-		t.Log("  configuration-cache dir was NOT restored (may not have been in the bundle)")
+		t.Log("  configuration-cache dir was NOT restored")
 	} else {
 		t.Log("  configuration-cache dir restored")
 	}
 
 	// ── Step 5: Rebuild and verify cache hits ────────────────────────────────
 	t.Log("Step 5: Rebuilding to verify cache hits...")
-	output := gradleRun(t, ctx, gradlew, projectDir, gradleUserHome, "build")
+	output := gradleRun(t, projectDir, gradlew, gradleUserHome, "build")
 
-	// Check for configuration cache reuse.
 	if strings.Contains(output, "Reusing configuration cache") {
 		t.Log("  Configuration cache: reused")
 	} else {
@@ -224,7 +234,6 @@ func TestIntegrationGradleBuildCycle(t *testing.T) {
 		}
 	}
 
-	// Check for build cache hits (FROM-CACHE) on compilation tasks.
 	fromCacheCount := strings.Count(output, "FROM-CACHE")
 	upToDateCount := strings.Count(output, "UP-TO-DATE")
 	t.Logf("  Task results: %d FROM-CACHE, %d UP-TO-DATE", fromCacheCount, upToDateCount)
@@ -237,10 +246,10 @@ func TestIntegrationGradleBuildCycle(t *testing.T) {
 }
 
 // gradleRun executes a Gradle build and returns the combined output.
-func gradleRun(t *testing.T, ctx context.Context, gradlew, projectDir, gradleUserHome string, tasks ...string) string {
+func gradleRun(t *testing.T, projectDir, gradlew, gradleUserHome string, tasks ...string) string {
 	t.Helper()
 	args := append(tasks, "--no-daemon", "--console=plain")
-	cmd := exec.CommandContext(ctx, gradlew, args...)
+	cmd := exec.Command(gradlew, args...)
 	cmd.Dir = projectDir
 	cmd.Env = gradleEnv(gradleUserHome)
 
