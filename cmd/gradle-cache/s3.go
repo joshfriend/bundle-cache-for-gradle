@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -421,6 +422,97 @@ func (c *s3Client) abortMultipartUpload(ctx context.Context, bucket, key, upload
 	io.Copy(io.Discard, resp.Body) //nolint:errcheck,gosec
 	resp.Body.Close()              //nolint:errcheck,gosec
 	return nil
+}
+
+// putStreamingMultipart uploads data from an io.Reader of unknown size using
+// S3 multipart upload. The input is split into uploadPartSize chunks which are
+// uploaded in parallel as they become available. This allows the archive
+// (tar+zstd) to run concurrently with the upload, overlapping I/O and
+// compression with network transfer.
+// Returns the total number of bytes uploaded.
+func (c *s3Client) putStreamingMultipart(ctx context.Context, bucket, key string, r io.Reader, contentType string) (int64, error) {
+	uploadID, err := c.createMultipartUpload(ctx, bucket, key, contentType)
+	if err != nil {
+		return 0, err
+	}
+
+	type partJob struct {
+		num  int
+		data []byte
+	}
+	type partResult struct {
+		num  int
+		size int
+		etag string
+		err  error
+	}
+
+	jobs := make(chan partJob, uploadWorkers)
+	results := make(chan partResult, uploadWorkers)
+
+	// Workers upload parts as they arrive.
+	var wg sync.WaitGroup
+	for range uploadWorkers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				etag, err := c.uploadPart(ctx, bucket, key, uploadID, job.num,
+					bytes.NewReader(job.data), int64(len(job.data)))
+				results <- partResult{num: job.num, size: len(job.data), etag: etag, err: err}
+			}
+		}()
+	}
+
+	// Reader goroutine: split input into uploadPartSize chunks and dispatch.
+	go func() {
+		partNum := 1
+		for {
+			buf := make([]byte, uploadPartSize)
+			n, err := io.ReadFull(r, buf)
+			if n > 0 {
+				jobs <- partJob{num: partNum, data: buf[:n]}
+				partNum++
+			}
+			if err != nil { // io.EOF or io.ErrUnexpectedEOF (last partial chunk)
+				break
+			}
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+
+	type completedPart struct {
+		XMLName    xml.Name `xml:"Part"`
+		PartNumber int      `xml:"PartNumber"`
+		ETag       string   `xml:"ETag"`
+	}
+	var parts []completedPart
+	var totalSize int64
+	var firstErr error
+	for r := range results {
+		if r.err != nil && firstErr == nil {
+			firstErr = r.err
+		}
+		if r.err == nil {
+			parts = append(parts, completedPart{PartNumber: r.num, ETag: r.etag})
+			totalSize += int64(r.size)
+		}
+	}
+
+	if firstErr != nil {
+		c.abortMultipartUpload(ctx, bucket, key, uploadID) //nolint:errcheck
+		return 0, firstErr
+	}
+
+	sort.Slice(parts, func(i, j int) bool { return parts[i].PartNumber < parts[j].PartNumber })
+
+	if err := c.completeMultipartUpload(ctx, bucket, key, uploadID, parts); err != nil {
+		return 0, err
+	}
+
+	return totalSize, nil
 }
 
 // objectURL returns the virtual-hosted S3 URL for the given bucket and key.

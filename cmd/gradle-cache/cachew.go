@@ -92,3 +92,38 @@ func (c *cachewClient) put(ctx context.Context, commit, cacheKey string, r io.Re
 	}
 	return nil
 }
+
+// putStream uploads from an io.Reader using chunked transfer encoding.
+// Returns the total bytes uploaded (counted locally).
+func (c *cachewClient) putStream(ctx context.Context, commit, cacheKey string, r io.Reader) (int64, error) {
+	cr := &countingReader{r: r}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.objectURL(commit, cacheKey), cr)
+	if err != nil {
+		return 0, err
+	}
+	req.ContentLength = -1 // chunked transfer encoding
+	req.Header.Set("Content-Type", "application/zstd")
+	req.Header.Set("Time-To-Live", "168h") // 7 days
+	resp, err := c.http.Do(req)            //nolint:gosec
+	if err != nil {
+		return cr.n, err
+	}
+	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	resp.Body.Close() //nolint:errcheck,gosec
+	if resp.StatusCode != http.StatusOK {
+		return cr.n, errors.Errorf("cachew POST %.8s: status %d: %s", commit, resp.StatusCode, msg)
+	}
+	return cr.n, nil
+}
+
+// countingReader wraps an io.Reader and counts bytes read.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
