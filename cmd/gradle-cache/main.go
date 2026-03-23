@@ -33,7 +33,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -873,18 +872,6 @@ func extractTarZstd(_ context.Context, r io.Reader, dir string) error {
 	return extractTarPlatform(dec, dir)
 }
 
-// zstdCompressCmd returns the command for zstd compression.
-// Prefers pzstd (creates parallel frames, decompressable in parallel) and
-// falls back to zstd -TN -c.
-func zstdCompressCmd(ctx context.Context) *exec.Cmd {
-	n := strconv.Itoa(max(1, runtime.NumCPU()))
-	if path, err := exec.LookPath("pzstd"); err == nil {
-		// -p N = N threads, -c write to stdout
-		return exec.CommandContext(ctx, path, "-p", n, "-c") //nolint:gosec
-	}
-	return exec.CommandContext(ctx, "zstd", "-T"+n, "-c") //nolint:gosec
-}
-
 // cacheExclusions are patterns for files and directories that should never be
 // included in cache bundles. Patterns with a leading * are suffix-matched;
 // all others are exact basename matches.
@@ -930,6 +917,11 @@ func isExcludedCache(name string) bool {
 // Multiple sources map to multiple -C baseDir path entries in the tar command,
 // which is how we combine caches + configuration-cache + convention build dirs into a single flat
 // archive.
+//
+// Compression uses the in-process klauspost/compress/zstd encoder with NumCPU
+// goroutines, producing parallel frames that can be decompressed in parallel.
+// This eliminates the pzstd/zstd subprocess and the IPC pipe between tar and
+// the compressor.
 func createTarZstd(ctx context.Context, w io.Writer, sources []tarSource) error {
 	args := []string{"-chf", "-"}
 	for _, pat := range cacheExclusions {
@@ -940,35 +932,39 @@ func createTarZstd(ctx context.Context, w io.Writer, sources []tarSource) error 
 		args = append(args, "-C", src.BaseDir, src.Path)
 	}
 	tarCmd := exec.CommandContext(ctx, "tar", args...) //nolint:gosec
-	zstdCmd := zstdCompressCmd(ctx)
 
 	tarStdout, err := tarCmd.StdoutPipe()
 	if err != nil {
 		return errors.Wrap(err, "tar stdout pipe")
 	}
 
-	var tarStderr, zstdStderr bytes.Buffer
+	var tarStderr bytes.Buffer
 	tarCmd.Stderr = &tarStderr
-	zstdCmd.Stdin = tarStdout
-	zstdCmd.Stdout = w
-	zstdCmd.Stderr = &zstdStderr
 
 	if err := tarCmd.Start(); err != nil {
 		return errors.Wrap(err, "start tar")
 	}
-	if err := zstdCmd.Start(); err != nil {
-		return errors.Join(errors.Wrap(err, "start zstd"), tarCmd.Wait())
+
+	enc, err := zstd.NewWriter(w,
+		zstd.WithEncoderConcurrency(runtime.NumCPU()),
+		zstd.WithWindowSize(zstd.MaxWindowSize))
+	if err != nil {
+		return errors.Join(errors.Wrap(err, "create zstd encoder"), tarCmd.Wait())
 	}
 
+	_, copyErr := io.Copy(enc, tarStdout)
+	encErr := enc.Close()
 	tarErr := tarCmd.Wait()
-	zstdErr := zstdCmd.Wait()
 
 	var errs []error
 	if tarErr != nil {
 		errs = append(errs, errors.Errorf("tar: %w: %s", tarErr, tarStderr.String()))
 	}
-	if zstdErr != nil {
-		errs = append(errs, errors.Errorf("zstd: %w: %s", zstdErr, zstdStderr.String()))
+	if copyErr != nil {
+		errs = append(errs, errors.Wrap(copyErr, "compress stream"))
+	}
+	if encErr != nil {
+		errs = append(errs, errors.Wrap(encErr, "close zstd encoder"))
 	}
 	return errors.Join(errs...)
 }
@@ -1096,33 +1092,20 @@ func touchMarkerFile(path string) error {
 // than the system tar command because the file list is already resolved to real paths
 // (the caches-dir symlink has been followed by filepath.Walk + EvalSymlinks), so
 // symlink dereferencing with -h is not required.
-func createDeltaTarZstd(ctx context.Context, w io.Writer, baseDir string, relPaths []string) error {
-	zstdCmd := zstdCompressCmd(ctx)
-
-	pr, pw := io.Pipe()
-	zstdCmd.Stdin = pr
-	zstdCmd.Stdout = w
-	var zstdStderr bytes.Buffer
-	zstdCmd.Stderr = &zstdStderr
-
-	if err := zstdCmd.Start(); err != nil {
-		return errors.Wrap(err, "start zstd")
+//
+// Compression uses the in-process klauspost/compress/zstd encoder.
+func createDeltaTarZstd(_ context.Context, w io.Writer, baseDir string, relPaths []string) error {
+	enc, err := zstd.NewWriter(w,
+		zstd.WithEncoderConcurrency(runtime.NumCPU()),
+		zstd.WithWindowSize(zstd.MaxWindowSize))
+	if err != nil {
+		return errors.Wrap(err, "create zstd encoder")
 	}
 
-	// Write the tar stream into the pipe concurrently with zstd compression.
-	tarErr := writeDeltaTar(pw, baseDir, relPaths)
-	pw.CloseWithError(tarErr) //nolint:errcheck,gosec
+	tarErr := writeDeltaTar(enc, baseDir, relPaths)
+	encErr := enc.Close()
 
-	zstdErr := zstdCmd.Wait()
-
-	var errs []error
-	if tarErr != nil {
-		errs = append(errs, tarErr)
-	}
-	if zstdErr != nil {
-		errs = append(errs, errors.Errorf("zstd: %w: %s", zstdErr, zstdStderr.String()))
-	}
-	return errors.Join(errs...)
+	return errors.Join(tarErr, encErr)
 }
 
 // writeDeltaTar writes a tar stream for the specified files to w.
