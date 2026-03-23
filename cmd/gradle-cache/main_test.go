@@ -834,6 +834,146 @@ func BenchmarkDeltaScanReal(b *testing.B) {
 	b.ReportMetric(float64(totalFiles), "files/op")
 }
 
+// ─── Zip-slip / path-traversal tests ──────────────────────────────────────────
+
+// TestExtractRejectsPathTraversal verifies that tar entries with ".." in the
+// name or symlinks pointing outside the destination are rejected.
+func TestExtractRejectsPathTraversal(t *testing.T) {
+	// Helper: build a tar archive in memory from a list of entries.
+	type entry struct {
+		name     string
+		typeflag byte
+		linkname string
+		body     string
+	}
+	buildTar := func(entries []entry) *bytes.Buffer {
+		var buf bytes.Buffer
+		tw := archive_tar.NewWriter(&buf)
+		for _, e := range entries {
+			hdr := &archive_tar.Header{
+				Name:     e.name,
+				Typeflag: e.typeflag,
+				Mode:     0o644,
+				Size:     int64(len(e.body)),
+				Linkname: e.linkname,
+			}
+			if e.typeflag == archive_tar.TypeDir {
+				hdr.Mode = 0o755
+				hdr.Size = 0
+			}
+			must(t, tw.WriteHeader(hdr))
+			if len(e.body) > 0 {
+				_, err := tw.Write([]byte(e.body))
+				must(t, err)
+			}
+		}
+		must(t, tw.Close())
+		return &buf
+	}
+
+	for _, tc := range []struct {
+		name    string
+		entries []entry
+	}{
+		{
+			name: "dotdot_file",
+			entries: []entry{
+				{name: "../etc/passwd", typeflag: archive_tar.TypeReg, body: "pwned"},
+			},
+		},
+		{
+			name: "dotdot_nested_file",
+			entries: []entry{
+				{name: "foo/../../etc/passwd", typeflag: archive_tar.TypeReg, body: "pwned"},
+			},
+		},
+		{
+			name: "absolute_file",
+			entries: []entry{
+				{name: "/etc/passwd", typeflag: archive_tar.TypeReg, body: "pwned"},
+			},
+		},
+		{
+			name: "symlink_absolute_escape",
+			entries: []entry{
+				{name: "link", typeflag: archive_tar.TypeSymlink, linkname: "/etc/passwd"},
+			},
+		},
+		{
+			name: "symlink_relative_escape",
+			entries: []entry{
+				{name: "link", typeflag: archive_tar.TypeSymlink, linkname: "../../etc/passwd"},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dstDir := t.TempDir()
+			buf := buildTar(tc.entries)
+			err := extractTarPlatform(bytes.NewReader(buf.Bytes()), dstDir)
+			if err == nil {
+				t.Fatal("expected error for path-traversal entry, got nil")
+			}
+			if !strings.Contains(err.Error(), "escapes") && !strings.Contains(err.Error(), "not allowed") {
+				t.Fatalf("expected 'escapes' or 'not allowed' in error, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestExtractRoutedSymlinkWithinArchive verifies that symlinks between routed
+// directories (e.g. configuration-cache/ → caches/) are accepted when they
+// stay within the archive root, even though the two directories are extracted
+// to different filesystem locations.
+func TestExtractRoutedSymlinkWithinArchive(t *testing.T) {
+	var buf bytes.Buffer
+	tw := archive_tar.NewWriter(&buf)
+
+	// A file in caches/ and a symlink in configuration-cache/ pointing to it.
+	for _, e := range []struct {
+		name, linkname, body string
+		typeflag             byte
+	}{
+		{name: "caches/modules/foo.bin", body: "data", typeflag: archive_tar.TypeReg},
+		{name: "configuration-cache/link", linkname: "../caches/modules/foo.bin", typeflag: archive_tar.TypeSymlink},
+	} {
+		hdr := &archive_tar.Header{
+			Name:     e.name,
+			Typeflag: e.typeflag,
+			Mode:     0o644,
+			Size:     int64(len(e.body)),
+			Linkname: e.linkname,
+		}
+		must(t, tw.WriteHeader(hdr))
+		if len(e.body) > 0 {
+			_, err := tw.Write([]byte(e.body))
+			must(t, err)
+		}
+	}
+	must(t, tw.Close())
+
+	gradleHome := t.TempDir()
+	projectDir := t.TempDir()
+	dotGradle := filepath.Join(projectDir, ".gradle")
+
+	rules := []extractRule{
+		{prefix: "caches/", baseDir: gradleHome},
+		{prefix: "configuration-cache/", baseDir: dotGradle},
+	}
+	targetFn := func(name string) string {
+		for _, rule := range rules {
+			if strings.HasPrefix(name, rule.prefix) {
+				return filepath.Join(rule.baseDir, name)
+			}
+		}
+		return filepath.Join(projectDir, name)
+	}
+
+	err := extractTarPlatformRouted(bytes.NewReader(buf.Bytes()), targetFn, false)
+	if err != nil {
+		t.Fatalf("expected routed cross-directory symlink to succeed, got: %v", err)
+	}
+}
+
 // ─── Extraction benchmark ─────────────────────────────────────────────────────
 
 // BenchmarkExtract measures extractTarPlatformRouted throughput against a
