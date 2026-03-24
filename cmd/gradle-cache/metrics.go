@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -131,15 +132,21 @@ func newDatadogAPIClient(apiKey string, baseTags []string) *datadogAPIClient {
 	}
 }
 
+// Datadog v2 metric type enum values.
+const (
+	ddMetricTypeGauge = 3
+	ddMetricTypeCount = 1
+)
+
 func (d *datadogAPIClient) timing(name string, ms int64, tags ...string) {
-	d.submit(name, float64(ms), "distribution", tags)
+	d.submit(name, float64(ms), ddMetricTypeGauge, tags)
 }
 
 func (d *datadogAPIClient) gauge(name string, value int64, tags ...string) {
-	d.submit(name, float64(value), "gauge", tags)
+	d.submit(name, float64(value), ddMetricTypeGauge, tags)
 }
 
-func (d *datadogAPIClient) submit(name string, value float64, metricType string, extraTags []string) {
+func (d *datadogAPIClient) submit(name string, value float64, metricType int, extraTags []string) {
 	allTags := append(d.tags, extraTags...)
 	now := time.Now().Unix()
 
@@ -180,7 +187,8 @@ func (d *datadogAPIClient) submit(name string, value float64, metricType string,
 	}
 	defer resp.Body.Close() //nolint:errcheck,gosec
 	if resp.StatusCode >= 400 {
-		slog.Warn("metrics: Datadog API returned error", "status", resp.StatusCode, "metric", name)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		slog.Warn("metrics: Datadog API returned error", "status", resp.StatusCode, "metric", name, "body", string(respBody))
 	}
 }
 
