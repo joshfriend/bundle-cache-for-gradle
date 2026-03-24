@@ -57,21 +57,24 @@ func detectStatsdAddr() string {
 func (f *metricsFlags) newMetricsClient() metricsClient {
 	if f.StatsdAddr != "" {
 		if c := newStatsdClient(f.StatsdAddr, f.MetricsTags); c != nil {
+			slog.Info("metrics: using DogStatsD", "addr", f.StatsdAddr)
 			return c
 		}
 		slog.Warn("failed to connect to DogStatsD, metrics disabled", "addr", f.StatsdAddr)
 		return noopMetrics{}
 	}
 	if f.DatadogAPIKey != "" {
+		slog.Info("metrics: using Datadog HTTP API")
 		return newDatadogAPIClient(f.DatadogAPIKey, f.MetricsTags)
 	}
 	// Auto-detect local DD agent.
 	if addr := detectStatsdAddr(); addr != "" {
 		if c := newStatsdClient(addr, f.MetricsTags); c != nil {
-			slog.Debug("auto-detected DogStatsD agent", "addr", addr)
+			slog.Info("metrics: auto-detected DogStatsD agent", "addr", addr)
 			return c
 		}
 	}
+	slog.Debug("metrics: no backend configured, metrics disabled")
 	return noopMetrics{}
 }
 
@@ -158,11 +161,13 @@ func (d *datadogAPIClient) submit(name string, value float64, metricType string,
 
 	body, err := json.Marshal(payload)
 	if err != nil {
+		slog.Warn("metrics: failed to marshal payload", "error", err)
 		return
 	}
 
 	req, err := http.NewRequest("POST", datadogSeriesURL, bytes.NewReader(body))
 	if err != nil {
+		slog.Warn("metrics: failed to create request", "error", err)
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -170,9 +175,13 @@ func (d *datadogAPIClient) submit(name string, value float64, metricType string,
 
 	resp, err := d.http.Do(req)
 	if err != nil {
+		slog.Warn("metrics: failed to submit to Datadog API", "error", err)
 		return
 	}
-	resp.Body.Close() //nolint:errcheck,gosec
+	defer resp.Body.Close() //nolint:errcheck,gosec
+	if resp.StatusCode >= 400 {
+		slog.Warn("metrics: Datadog API returned error", "status", resp.StatusCode, "metric", name)
+	}
 }
 
 func (d *datadogAPIClient) close() {}
