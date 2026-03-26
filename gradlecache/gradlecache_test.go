@@ -1,5 +1,5 @@
 //nolint:gosec // test file: all paths and subprocess args are controlled inputs
-package main
+package gradlecache
 
 import (
 	archive_tar "archive/tar"
@@ -30,7 +30,7 @@ func TestIsExcludedCache(t *testing.T) {
 		"gradle-cache.lock",
 	}
 	for _, name := range excluded {
-		if !isExcludedCache(name) {
+		if !IsExcludedCache(name) {
 			t.Errorf("expected %q to be excluded", name)
 		}
 	}
@@ -44,7 +44,7 @@ func TestIsExcludedCache(t *testing.T) {
 		"build.gradle.kts",
 	}
 	for _, name := range allowed {
-		if isExcludedCache(name) {
+		if IsExcludedCache(name) {
 			t.Errorf("expected %q to NOT be excluded", name)
 		}
 	}
@@ -109,12 +109,12 @@ func TestS3Key(t *testing.T) {
 	}
 }
 
-// ─── conventionBuildDirs tests ───────────────────────────────────────────────
+// ─── ConventionBuildDirs tests ───────────────────────────────────────────────
 
 func TestConventionBuildDirs(t *testing.T) {
 	t.Run("empty directory returns nothing", func(t *testing.T) {
 		root := t.TempDir()
-		if got := conventionBuildDirs(root, []string{"buildSrc"}); len(got) != 0 {
+		if got := ConventionBuildDirs(root, []string{"buildSrc"}); len(got) != 0 {
 			t.Errorf("expected empty, got %v", got)
 		}
 	})
@@ -122,7 +122,7 @@ func TestConventionBuildDirs(t *testing.T) {
 	t.Run("buildSrc without build subdir is excluded", func(t *testing.T) {
 		root := t.TempDir()
 		must(t, os.MkdirAll(filepath.Join(root, "buildSrc"), 0o755))
-		if got := conventionBuildDirs(root, []string{"buildSrc"}); len(got) != 0 {
+		if got := ConventionBuildDirs(root, []string{"buildSrc"}); len(got) != 0 {
 			t.Errorf("expected empty, got %v", got)
 		}
 	})
@@ -130,7 +130,7 @@ func TestConventionBuildDirs(t *testing.T) {
 	t.Run("buildSrc/build is included when configured", func(t *testing.T) {
 		root := t.TempDir()
 		must(t, os.MkdirAll(filepath.Join(root, "buildSrc", "build"), 0o755))
-		got := conventionBuildDirs(root, []string{"buildSrc"})
+		got := ConventionBuildDirs(root, []string{"buildSrc"})
 		if len(got) != 1 || got[0] != "buildSrc/build" {
 			t.Errorf("got %v, want [buildSrc/build]", got)
 		}
@@ -140,7 +140,7 @@ func TestConventionBuildDirs(t *testing.T) {
 		root := t.TempDir()
 		must(t, os.MkdirAll(filepath.Join(root, "buildSrc", "build"), 0o755))
 		// build-logic is configured but doesn't exist; buildSrc exists but isn't configured.
-		got := conventionBuildDirs(root, []string{"build-logic"})
+		got := ConventionBuildDirs(root, []string{"build-logic"})
 		if len(got) != 0 {
 			t.Errorf("expected empty, got %v", got)
 		}
@@ -149,7 +149,7 @@ func TestConventionBuildDirs(t *testing.T) {
 	t.Run("build-logic/build included when configured", func(t *testing.T) {
 		root := t.TempDir()
 		must(t, os.MkdirAll(filepath.Join(root, "build-logic", "build"), 0o755))
-		got := conventionBuildDirs(root, []string{"build-logic"})
+		got := ConventionBuildDirs(root, []string{"build-logic"})
 		if len(got) != 1 || got[0] != "build-logic/build" {
 			t.Errorf("got %v, want [build-logic/build]", got)
 		}
@@ -159,7 +159,7 @@ func TestConventionBuildDirs(t *testing.T) {
 		root := t.TempDir()
 		must(t, os.MkdirAll(filepath.Join(root, "buildSrc", "build"), 0o755))
 		must(t, os.MkdirAll(filepath.Join(root, "build-logic", "build"), 0o755))
-		got := conventionBuildDirs(root, []string{"buildSrc", "build-logic"})
+		got := ConventionBuildDirs(root, []string{"buildSrc", "build-logic"})
 		sort.Strings(got)
 		if len(got) != 2 || got[0] != "build-logic/build" || got[1] != "buildSrc/build" {
 			t.Errorf("got %v, want [build-logic/build buildSrc/build]", got)
@@ -169,7 +169,7 @@ func TestConventionBuildDirs(t *testing.T) {
 	t.Run("glob plugins/* finds subdirectory build dirs", func(t *testing.T) {
 		root := t.TempDir()
 		must(t, os.MkdirAll(filepath.Join(root, "plugins", "foo", "build"), 0o755))
-		got := conventionBuildDirs(root, []string{"plugins/*"})
+		got := ConventionBuildDirs(root, []string{"plugins/*"})
 		if len(got) != 1 || got[0] != "plugins/foo/build" {
 			t.Errorf("got %v, want [plugins/foo/build]", got)
 		}
@@ -178,7 +178,7 @@ func TestConventionBuildDirs(t *testing.T) {
 	t.Run("glob plugins/* excludes subdirs without a build dir", func(t *testing.T) {
 		root := t.TempDir()
 		must(t, os.MkdirAll(filepath.Join(root, "plugins", "foo"), 0o755))
-		if got := conventionBuildDirs(root, []string{"plugins/*"}); len(got) != 0 {
+		if got := ConventionBuildDirs(root, []string{"plugins/*"}); len(got) != 0 {
 			t.Errorf("expected empty, got %v", got)
 		}
 	})
@@ -187,7 +187,7 @@ func TestConventionBuildDirs(t *testing.T) {
 		root := t.TempDir()
 		must(t, os.MkdirAll(filepath.Join(root, "plugins", "foo"), 0o755))
 		must(t, os.WriteFile(filepath.Join(root, "plugins", "foo", "build"), []byte("nope"), 0o644))
-		if got := conventionBuildDirs(root, []string{"plugins/*"}); len(got) != 0 {
+		if got := ConventionBuildDirs(root, []string{"plugins/*"}); len(got) != 0 {
 			t.Errorf("expected empty, got %v", got)
 		}
 	})
@@ -197,7 +197,7 @@ func TestConventionBuildDirs(t *testing.T) {
 		for _, p := range []string{"alpha", "beta", "gamma"} {
 			must(t, os.MkdirAll(filepath.Join(root, "plugins", p, "build"), 0o755))
 		}
-		got := conventionBuildDirs(root, []string{"plugins/*"})
+		got := ConventionBuildDirs(root, []string{"plugins/*"})
 		if len(got) != 3 {
 			t.Errorf("expected 3 entries, got %v", got)
 		}
@@ -205,7 +205,7 @@ func TestConventionBuildDirs(t *testing.T) {
 
 	t.Run("missing glob parent directory is silently ignored", func(t *testing.T) {
 		root := t.TempDir()
-		if got := conventionBuildDirs(root, []string{"plugins/*"}); len(got) != 0 {
+		if got := ConventionBuildDirs(root, []string{"plugins/*"}); len(got) != 0 {
 			t.Errorf("expected empty for missing parent, got %v", got)
 		}
 	})
@@ -214,7 +214,7 @@ func TestConventionBuildDirs(t *testing.T) {
 		root := t.TempDir()
 		must(t, os.MkdirAll(filepath.Join(root, "buildSrc", "build"), 0o755))
 		must(t, os.MkdirAll(filepath.Join(root, "plugins", "foo", "build"), 0o755))
-		got := conventionBuildDirs(root, []string{"buildSrc", "plugins/*"})
+		got := ConventionBuildDirs(root, []string{"buildSrc", "plugins/*"})
 		sort.Strings(got)
 		if len(got) != 2 || got[0] != "buildSrc/build" || got[1] != "plugins/foo/build" {
 			t.Errorf("got %v, want [buildSrc/build plugins/foo/build]", got)
@@ -222,14 +222,14 @@ func TestConventionBuildDirs(t *testing.T) {
 	})
 }
 
-// ─── projectDirSources tests ─────────────────────────────────────────────────
+// ─── ProjectDirSources tests ─────────────────────────────────────────────────
 
 func TestProjectDirSources(t *testing.T) {
 	defaultBuilds := []string{"buildSrc"}
 
 	t.Run("empty project dir returns no sources", func(t *testing.T) {
 		root := t.TempDir()
-		if got := projectDirSources(root, defaultBuilds); len(got) != 0 {
+		if got := ProjectDirSources(root, defaultBuilds); len(got) != 0 {
 			t.Errorf("expected no sources, got %v", got)
 		}
 	})
@@ -237,7 +237,7 @@ func TestProjectDirSources(t *testing.T) {
 	t.Run("configuration-cache source has correct BaseDir and Path", func(t *testing.T) {
 		root := t.TempDir()
 		must(t, os.MkdirAll(filepath.Join(root, ".gradle", "configuration-cache"), 0o755))
-		sources := projectDirSources(root, defaultBuilds)
+		sources := ProjectDirSources(root, defaultBuilds)
 		if len(sources) != 1 {
 			t.Fatalf("expected 1 source, got %v", sources)
 		}
@@ -253,7 +253,7 @@ func TestProjectDirSources(t *testing.T) {
 	t.Run("buildSrc/build source has correct BaseDir and Path", func(t *testing.T) {
 		root := t.TempDir()
 		must(t, os.MkdirAll(filepath.Join(root, "buildSrc", "build"), 0o755))
-		sources := projectDirSources(root, defaultBuilds)
+		sources := ProjectDirSources(root, defaultBuilds)
 		if len(sources) != 1 {
 			t.Fatalf("expected 1 source, got %v", sources)
 		}
@@ -268,7 +268,7 @@ func TestProjectDirSources(t *testing.T) {
 	t.Run("build-logic included when configured", func(t *testing.T) {
 		root := t.TempDir()
 		must(t, os.MkdirAll(filepath.Join(root, "build-logic", "build"), 0o755))
-		sources := projectDirSources(root, []string{"build-logic"})
+		sources := ProjectDirSources(root, []string{"build-logic"})
 		if len(sources) != 1 || sources[0].Path != "./build-logic/build" {
 			t.Errorf("expected build-logic/build, got %v", sources)
 		}
@@ -279,7 +279,7 @@ func TestProjectDirSources(t *testing.T) {
 		must(t, os.MkdirAll(filepath.Join(root, ".gradle", "configuration-cache"), 0o755))
 		must(t, os.MkdirAll(filepath.Join(root, "buildSrc", "build"), 0o755))
 		must(t, os.MkdirAll(filepath.Join(root, "plugins", "foo", "build"), 0o755))
-		sources := projectDirSources(root, []string{"buildSrc", "plugins/*"})
+		sources := ProjectDirSources(root, []string{"buildSrc", "plugins/*"})
 		// configuration-cache + buildSrc/build + plugins/foo/build = 3
 		if len(sources) != 3 {
 			t.Errorf("expected 3 sources, got %d: %v", len(sources), sources)
@@ -466,7 +466,7 @@ func TestHistoryCommits(t *testing.T) {
 
 // ─── Round-trip archive test ─────────────────────────────────────────────────
 
-// TestTarZstdRoundTrip verifies that createTarZstd → extractTarZstd preserves
+// TestTarZstdRoundTrip verifies that CreateTarZstd → extractTarZstd preserves
 // the expected directory structure, including multi-source archives.
 func TestTarZstdRoundTrip(t *testing.T) {
 	if _, err := exec.LookPath("tar"); err != nil {
@@ -505,7 +505,7 @@ func TestTarZstdRoundTrip(t *testing.T) {
 	must(t, os.MkdirAll(filepath.Join(projectDir, "buildSrc", "build", "libs"), 0o755))
 	must(t, os.WriteFile(filepath.Join(projectDir, "buildSrc", "build", "libs", "buildSrc.jar"), []byte("buildsrc jar"), 0o644))
 
-	sources := []tarSource{
+	sources := []TarSource{
 		{BaseDir: gradleHome, Path: "./caches"},
 		{BaseDir: gradleHome, Path: "./wrapper"},
 		{BaseDir: gradleDir, Path: "./configuration-cache"},
@@ -514,8 +514,8 @@ func TestTarZstdRoundTrip(t *testing.T) {
 
 	// Create archive into a buffer.
 	var buf bytes.Buffer
-	if err := createTarZstd(ctx, &buf, sources); err != nil {
-		t.Fatalf("createTarZstd: %v", err)
+	if err := CreateTarZstd(ctx, &buf, sources); err != nil {
+		t.Fatalf("CreateTarZstd: %v", err)
 	}
 
 	// Extract into a fresh directory.
@@ -580,8 +580,8 @@ func TestTarZstdSymlinkDereference(t *testing.T) {
 	must(t, os.Symlink(realDir, cachesLink))
 
 	var buf bytes.Buffer
-	if err := createTarZstd(ctx, &buf, []tarSource{{BaseDir: srcDir, Path: "./caches"}}); err != nil {
-		t.Fatalf("createTarZstd: %v", err)
+	if err := CreateTarZstd(ctx, &buf, []TarSource{{BaseDir: srcDir, Path: "./caches"}}); err != nil {
+		t.Fatalf("CreateTarZstd: %v", err)
 	}
 
 	dstDir := t.TempDir()
@@ -641,7 +641,7 @@ func TestDeltaCommit(t *testing.T) {
 
 // ─── Delta archive round-trip test ───────────────────────────────────────────
 
-// TestDeltaTarZstdRoundTrip verifies that createDeltaTarZstd/writeDeltaTar pack
+// TestDeltaTarZstdRoundTrip verifies that CreateDeltaTarZstd/writeDeltaTar pack
 // only the files listed and that they can be extracted back via extractTarZstd.
 // It also exercises the mtime-based file selection used by SaveDeltaCmd: a
 // "base" file is written before the marker and a "new" file after, and only the
@@ -693,7 +693,7 @@ func TestDeltaTarZstdRoundTrip(t *testing.T) {
 
 	// Pack the delta.
 	var buf bytes.Buffer
-	must(t, createDeltaTarZstd(ctx, &buf, gradleHome, newFiles))
+	must(t, CreateDeltaTarZstd(ctx, &buf, gradleHome, newFiles))
 
 	// Extract into a fresh directory and verify only the new file is present.
 	dstDir := t.TempDir()
@@ -787,7 +787,7 @@ func BenchmarkDeltaScan(b *testing.B) {
 	}
 }
 
-// BenchmarkDeltaScanReal exercises the production collectNewFiles path against a real
+// BenchmarkDeltaScanReal exercises the production CollectNewFiles path against a real
 // extracted cache. Point GRADLE_CACHE_BENCH_DIR at the caches/ directory from a prior
 // restore (the symlink or its real target) and run:
 //
@@ -832,7 +832,7 @@ func BenchmarkDeltaScanReal(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for range b.N {
-		files, err := collectNewFiles(realCaches, since, gradleHome)
+		files, err := CollectNewFiles(realCaches, since, gradleHome)
 		if err != nil {
 			b.Fatal(err)
 		}

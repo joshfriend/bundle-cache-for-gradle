@@ -1,6 +1,6 @@
 //go:build !darwin
 
-package main
+package gradlecache
 
 import (
 	"archive/tar"
@@ -13,34 +13,18 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const (
-	// maxParallelFileSize is the largest file that will be buffered in memory
-	// and dispatched to the worker pool. Files larger than this are written
-	// inline in the main goroutine to keep peak memory bounded.
-	// At 4 MiB, 99.97 % of Gradle cache entries go through the parallel path.
-	maxParallelFileSize = 4 << 20 // 4 MiB
-)
+const maxParallelFileSize = 4 << 20
 
-// extractWorkerCount returns the number of parallel file-write goroutines.
-// Benchmarking showed extraction throughput is IOPS-bound on small file
-// creation — the full S3 pipeline is IOPS-bound on XFS RAID0 and worker
-// count has no measurable effect from 8 to 128. We use 16 as a sensible
-// default above the measured knee at 8.
 func extractWorkerCount() int {
 	return 16
 }
 
-// extractTarPlatform uses parallel extraction on Linux.
-// See extractTarParallelRouted for the implementation rationale.
 func extractTarPlatform(r io.Reader, dir string) error {
 	return extractTarParallelRouted(r, func(name string) string {
 		return filepath.Join(dir, name)
 	}, false)
 }
 
-// extractTarPlatformRouted is the routing-aware variant of extractTarPlatform.
-// targetFn maps a cleaned tar entry name to its absolute destination path.
-// If skipExisting is true, files that already exist on disk are left untouched.
 func extractTarPlatformRouted(r io.Reader, targetFn func(string) string, skipExisting bool) error {
 	return extractTarParallelRouted(r, targetFn, skipExisting)
 }
@@ -51,15 +35,6 @@ type writeJob struct {
 	data   []byte
 }
 
-// extractTarParallelRouted reads a tar stream and writes files using a pool of
-// goroutines. The main goroutine reads tar entries and buffers small file
-// contents; workers write those files to disk concurrently. Large files are
-// written inline to keep memory use bounded.
-//
-// Parallelising writes hides the per-file open/write/close syscall latency
-// (the dominant cost when extracting hundreds of thousands of small files),
-// allowing the upstream download+decompression pipeline to run at full speed
-// instead of being throttled by sequential I/O.
 func extractTarParallelRouted(r io.Reader, targetFn func(string) string, skipExisting bool) error {
 	numWorkers := extractWorkerCount()
 	jobs := make(chan writeJob, numWorkers*2)
@@ -85,15 +60,14 @@ func extractTarParallelRouted(r io.Reader, targetFn func(string) string, skipExi
 		})
 	}
 
-	copyBuf := make([]byte, 1<<20) // reused only for inline large-file writes
+	copyBuf := make([]byte, 1<<20)
 
-	// createdDirs is accessed only by the main goroutine, so no mutex needed.
 	createdDirs := make(map[string]struct{})
 	ensureDir := func(d string, mode os.FileMode) error {
 		if _, ok := createdDirs[d]; ok {
 			return nil
 		}
-		if err := os.MkdirAll(d, mode); err != nil { //nolint:gosec // path is validated by caller
+		if err := os.MkdirAll(d, mode); err != nil { //nolint:gosec
 			return err
 		}
 		createdDirs[d] = struct{}{}
@@ -111,9 +85,6 @@ func extractTarParallelRouted(r io.Reader, targetFn func(string) string, skipExi
 	return writeErr
 }
 
-// readTarEntries iterates over a tar stream and dispatches file writes to the
-// jobs channel. Directories, symlinks, and hardlinks are handled inline.
-// Large files (>maxParallelFileSize) are written inline to bound memory.
 func readTarEntries(
 	r io.Reader,
 	targetFn func(string) string,
@@ -143,8 +114,6 @@ func readTarEntries(
 	}
 }
 
-// processEntry handles a single tar header+body: directories, regular files,
-// symlinks, and hardlinks. It returns an error if the entry cannot be processed.
 func processEntry(
 	tr *tar.Reader,
 	hdr *tar.Header,

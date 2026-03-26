@@ -417,6 +417,13 @@ func gradleEnv(gradleUserHome string) []string {
 	)
 }
 
+func must(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func extractLine(output, substr string) string {
 	for _, line := range strings.Split(output, "\n") {
 		if strings.Contains(strings.ToLower(line), strings.ToLower(substr)) {

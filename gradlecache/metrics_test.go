@@ -1,4 +1,4 @@
-package main
+package gradlecache
 
 import (
 	"net"
@@ -15,13 +15,13 @@ func TestStatsdClientDistribution(t *testing.T) {
 	defer func() { _ = pc.Close() }()
 
 	addr := pc.LocalAddr().String()
-	client := newStatsdClient(addr, []string{"env:test"})
+	client := NewStatsdClient(addr, []string{"env:test"})
 	if client == nil {
 		t.Fatal("expected non-nil statsd client")
 	}
-	defer client.close()
+	defer client.Close()
 
-	client.distribution("gradle_cache.restore.duration_ms", 1234, "cache_key:foo")
+	client.Distribution("gradle_cache.restore.duration_ms", 1234, "cache_key:foo")
 
 	buf := make([]byte, 1024)
 	_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -45,13 +45,13 @@ func TestStatsdClientDistributionFloat(t *testing.T) {
 	defer func() { _ = pc.Close() }()
 
 	addr := pc.LocalAddr().String()
-	client := newStatsdClient(addr, nil)
+	client := NewStatsdClient(addr, nil)
 	if client == nil {
 		t.Fatal("expected non-nil statsd client")
 	}
-	defer client.close()
+	defer client.Close()
 
-	client.distribution("gradle_cache.restore.speed_mbps", 155.6)
+	client.Distribution("gradle_cache.restore.speed_mbps", 155.6)
 
 	buf := make([]byte, 1024)
 	_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -69,16 +69,16 @@ func TestStatsdClientDistributionFloat(t *testing.T) {
 
 func TestNoopMetrics(t *testing.T) {
 	// noopMetrics should not panic.
-	var m metricsClient = noopMetrics{}
-	m.distribution("test.metric", 100)
-	m.close()
+	var m MetricsClient = NoopMetrics{}
+	m.Distribution("test.metric", 100)
+	m.Close()
 }
 
 func TestMetricsFlagsNoneConfigured(t *testing.T) {
 	// Unset DD env vars so auto-detection doesn't interfere.
 	t.Setenv("DD_AGENT_HOST", "")
-	f := &metricsFlags{}
-	m := f.newMetricsClient()
-	// Should always return a non-nil client (noopMetrics when no backend configured).
-	m.close()
+	f := &MetricsFlags{}
+	m := f.NewMetricsClient()
+	// Should always return a non-nil client (NoopMetrics when no backend configured).
+	m.Close()
 }

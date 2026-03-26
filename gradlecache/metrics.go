@@ -1,4 +1,4 @@
-package main
+package gradlecache
 
 import (
 	"bytes"
@@ -13,32 +13,28 @@ import (
 	"time"
 )
 
-// metricsClient emits distribution metrics to a backend.
-// All metrics are submitted as distributions to support percentile aggregation.
-type metricsClient interface {
-	// distribution records a single sample for a distribution metric.
-	distribution(name string, value float64, tags ...string)
-	// close flushes any pending data.
-	close()
+// MetricsClient emits distribution metrics to a backend.
+type MetricsClient interface {
+	Distribution(name string, value float64, tags ...string)
+	Close()
 }
 
-// noopMetrics is a no-op metricsClient used when no backend is configured.
-// It exists because kong cannot bind a nil interface value.
-type noopMetrics struct{}
+// NoopMetrics is a no-op MetricsClient used when no backend is configured.
+type NoopMetrics struct{}
 
-func (noopMetrics) distribution(string, float64, ...string) {}
-func (noopMetrics) close()                                  {}
+func (NoopMetrics) Distribution(string, float64, ...string) {}
+func (NoopMetrics) Close()                                  {}
 
-// metricsFlags are CLI flags for configuring metrics emission.
-type metricsFlags struct {
-	StatsdAddr    string   `help:"DogStatsD address (host:port) for emitting metrics. Auto-detected from DD_AGENT_HOST if not set."`
-	DatadogAPIKey string   `help:"DataDog API key for direct metric submission (no agent required)." env:"DATADOG_API_KEY"`
-	MetricsTags   []string `help:"Additional metric tags in key:value format. May be repeated." name:"metrics-tag"`
+// MetricsFlags are CLI flags for configuring metrics emission.
+type MetricsFlags struct {
+	StatsdAddr    string
+	DatadogAPIKey string
+	MetricsTags   []string
 }
 
-// detectStatsdAddr returns the DogStatsD address from the environment, or empty
+// DetectStatsdAddr returns the DogStatsD address from the environment, or empty
 // if DD_AGENT_HOST is not set.
-func detectStatsdAddr() string {
+func DetectStatsdAddr() string {
 	host := os.Getenv("DD_AGENT_HOST")
 	if host == "" {
 		return ""
@@ -50,53 +46,52 @@ func detectStatsdAddr() string {
 	return net.JoinHostPort(host, port)
 }
 
-// newMetricsClient returns a metricsClient based on the configured flags.
-// If no explicit backend is configured, auto-detects a local DD agent.
-// Returns a no-op client if no metrics backend is available.
-func (f *metricsFlags) newMetricsClient() metricsClient {
+// NewMetricsClient returns a MetricsClient based on the configured flags.
+func (f *MetricsFlags) NewMetricsClient() MetricsClient {
 	if f.StatsdAddr != "" {
-		if c := newStatsdClient(f.StatsdAddr, f.MetricsTags); c != nil {
+		if c := NewStatsdClient(f.StatsdAddr, f.MetricsTags); c != nil {
 			slog.Info("metrics: using DogStatsD", "addr", f.StatsdAddr)
 			return c
 		}
 		slog.Warn("failed to connect to DogStatsD, metrics disabled", "addr", f.StatsdAddr)
-		return noopMetrics{}
+		return NoopMetrics{}
 	}
 	if f.DatadogAPIKey != "" {
 		slog.Info("metrics: using Datadog HTTP API")
-		return newDatadogAPIClient(f.DatadogAPIKey, f.MetricsTags)
+		return NewDatadogAPIClient(f.DatadogAPIKey, f.MetricsTags)
 	}
-	// Auto-detect local DD agent.
-	if addr := detectStatsdAddr(); addr != "" {
-		if c := newStatsdClient(addr, f.MetricsTags); c != nil {
+	if addr := DetectStatsdAddr(); addr != "" {
+		if c := NewStatsdClient(addr, f.MetricsTags); c != nil {
 			slog.Info("metrics: auto-detected DogStatsD agent", "addr", addr)
 			return c
 		}
 	}
 	slog.Debug("metrics: no backend configured, metrics disabled")
-	return noopMetrics{}
+	return NoopMetrics{}
 }
 
 // ── DogStatsD (UDP) ─────────────────────────────────────────────────────────
 
-type statsdClient struct {
+// StatsdClient sends metrics via DogStatsD UDP protocol.
+type StatsdClient struct {
 	conn net.Conn
 	tags []string
 }
 
-func newStatsdClient(addr string, baseTags []string) *statsdClient {
+// NewStatsdClient creates a new statsd client, or nil if connection fails.
+func NewStatsdClient(addr string, baseTags []string) *StatsdClient {
 	conn, err := net.DialTimeout("udp", addr, 2*time.Second)
 	if err != nil {
 		return nil
 	}
-	return &statsdClient{conn: conn, tags: baseTags}
+	return &StatsdClient{conn: conn, tags: baseTags}
 }
 
-func (s *statsdClient) distribution(name string, value float64, tags ...string) {
+func (s *StatsdClient) Distribution(name string, value float64, tags ...string) {
 	s.send(fmt.Sprintf("%s:%g|d", name, value), tags)
 }
 
-func (s *statsdClient) send(stat string, extraTags []string) {
+func (s *StatsdClient) send(stat string, extraTags []string) {
 	allTags := append(s.tags, extraTags...)
 	if len(allTags) > 0 {
 		stat += "|#" + strings.Join(allTags, ",")
@@ -104,7 +99,7 @@ func (s *statsdClient) send(stat string, extraTags []string) {
 	s.conn.Write([]byte(stat)) //nolint:errcheck,gosec
 }
 
-func (s *statsdClient) close() {
+func (s *StatsdClient) Close() {
 	s.conn.Close() //nolint:errcheck,gosec
 }
 
@@ -112,25 +107,26 @@ func (s *statsdClient) close() {
 
 const datadogDistURL = "https://api.datadoghq.com/api/v1/distribution_points"
 
-type datadogAPIClient struct {
+// DatadogAPIClient sends metrics via the Datadog HTTP API.
+type DatadogAPIClient struct {
 	apiKey string
 	tags   []string
 	http   *http.Client
 }
 
-func newDatadogAPIClient(apiKey string, baseTags []string) *datadogAPIClient {
-	return &datadogAPIClient{
+// NewDatadogAPIClient creates a new Datadog API client.
+func NewDatadogAPIClient(apiKey string, baseTags []string) *DatadogAPIClient {
+	return &DatadogAPIClient{
 		apiKey: apiKey,
 		tags:   baseTags,
 		http:   &http.Client{Timeout: 5 * time.Second},
 	}
 }
 
-func (d *datadogAPIClient) distribution(name string, value float64, tags ...string) {
+func (d *DatadogAPIClient) Distribution(name string, value float64, tags ...string) {
 	allTags := append(d.tags, tags...)
 	now := time.Now().Unix()
 
-	// v1 distribution_points format: points is [[timestamp, [value, ...]]]
 	payload := map[string]interface{}{
 		"series": []map[string]interface{}{
 			{
@@ -169,4 +165,4 @@ func (d *datadogAPIClient) distribution(name string, value float64, tags ...stri
 	}
 }
 
-func (d *datadogAPIClient) close() {}
+func (d *DatadogAPIClient) Close() {}

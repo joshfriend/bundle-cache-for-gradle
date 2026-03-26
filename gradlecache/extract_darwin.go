@@ -1,4 +1,4 @@
-package main
+package gradlecache
 
 import (
 	"archive/tar"
@@ -11,10 +11,6 @@ import (
 	"github.com/alecthomas/errors"
 )
 
-// extractBufPool is a pool of reusable byte-slice pointers used by extractTarGo
-// on macOS. Reusing slices eliminates per-file heap allocations for the parallel
-// write path. Initial capacity is 256 KiB — large enough for most Gradle cache
-// files without needing a separate allocation.
 var extractBufPool = sync.Pool{
 	New: func() interface{} {
 		b := make([]byte, 0, 256<<10)
@@ -22,41 +18,25 @@ var extractBufPool = sync.Pool{
 	},
 }
 
-// mmapThreshold is the minimum file size above which ftruncate+mmap+memcpy is
-// faster than write() on macOS APFS. Below this threshold, mmap setup overhead
-// exceeds the savings. 64 KB covers most Gradle .jar files.
 const mmapThreshold = 64 * 1024
 
-// darwinExtractWorkers controls the number of parallel file-write goroutines
-// on macOS. Benchmarking on Apple M3 Max (APFS) showed the sweet spot at 8
-// workers — performance degrades sharply above that due to APFS B-tree
-// lock contention on concurrent file creates.
 var darwinExtractWorkers = 8
 
-// extractTarPlatform uses the optimised parallel extractor on macOS. APFS
-// handles concurrent writes to independent files efficiently, so parallel
-// workers saturate IOPS better than a single sequential writer would.
 func extractTarPlatform(r io.Reader, dir string) error {
 	return extractTarGoRouted(r, func(name string) string {
 		return filepath.Join(dir, name)
 	}, false)
 }
 
-// extractTarPlatformRouted is the routing-aware variant of extractTarPlatform.
-// targetFn maps a cleaned tar entry name to its absolute destination path.
-// If skipExisting is true, files that already exist on disk are left untouched.
 func extractTarPlatformRouted(r io.Reader, targetFn func(string) string, skipExisting bool) error {
 	return extractTarGoRouted(r, targetFn, skipExisting)
 }
 
-// extractTarGoRouted is the core parallel extractor. targetFn maps a cleaned
-// tar entry name (e.g. "caches/8.14.3/foo") to its absolute destination path.
-// skipExisting skips writing files that already exist on disk.
 func extractTarGoRouted(r io.Reader, targetFn func(string) string, skipExisting bool) error {
 	type fileJob struct {
 		path string
 		mode os.FileMode
-		buf  *[]byte // must be returned to extractBufPool after use
+		buf  *[]byte
 	}
 
 	numWorkers := darwinExtractWorkers
@@ -81,15 +61,12 @@ func extractTarGoRouted(r io.Reader, targetFn func(string) string, skipExisting 
 		}()
 	}
 
-	// createdDirs tracks directories the reader goroutine has already ensured
-	// exist. Workers never call MkdirAll, so APFS B-tree updates from directory
-	// creation are serialised through the reader and don't contend with writes.
 	createdDirs := make(map[string]struct{})
 	ensureDir := func(d string, mode os.FileMode) error {
 		if _, ok := createdDirs[d]; ok {
 			return nil
 		}
-		if err := os.MkdirAll(d, mode); err != nil { //nolint:gosec // path is validated by caller
+		if err := os.MkdirAll(d, mode); err != nil { //nolint:gosec
 			return err
 		}
 		createdDirs[d] = struct{}{}
@@ -109,7 +86,6 @@ readLoop:
 			break
 		}
 
-		// Reject path traversal before passing to targetFn.
 		name, err := safeTarEntryName(hdr.Name)
 		if err != nil {
 			readErr = err
@@ -201,11 +177,6 @@ readLoop:
 	return errors.Join(allErrs...)
 }
 
-// writeFileMacos writes data to path. Files >= mmapThreshold use ftruncate +
-// mmap + memcpy: APFS allocates one contiguous extent from the truncate call
-// and the Mach VM subsystem writes pages lazily, reducing per-page syscall
-// overhead compared to write(). Smaller files use write() directly since mmap
-// setup cost exceeds the savings for short payloads.
 func writeFileMacos(path string, data []byte, mode os.FileMode) error {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
@@ -223,7 +194,6 @@ func writeFileMacos(path string, data []byte, mode os.FileMode) error {
 				return nil
 			}
 		}
-		// Truncate or mmap failed — fall through to write().
 	}
 
 	if _, err := f.Write(data); err != nil {

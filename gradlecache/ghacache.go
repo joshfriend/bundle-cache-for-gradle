@@ -1,4 +1,4 @@
-package main
+package gradlecache
 
 import (
 	"bytes"
@@ -176,7 +176,7 @@ func (g *ghaCacheStore) metadata() ghaCacheMetadata {
 }
 
 // stat checks whether a cache entry exists.
-func (g *ghaCacheStore) stat(ctx context.Context, commit, cacheKey string) (int64, error) {
+func (g *ghaCacheStore) stat(ctx context.Context, commit, cacheKey string) (bundleStatInfo, error) {
 	key := ghaCacheKey(commit, cacheKey)
 	version := ghaCacheVersion(cacheKey)
 
@@ -187,16 +187,16 @@ func (g *ghaCacheStore) stat(ctx context.Context, commit, cacheKey string) (int6
 		Version:  version,
 	}, &resp)
 	if err != nil {
-		return 0, errors.Errorf("gha cache: not found for %.8s: %w", commit, err)
+		return bundleStatInfo{}, errors.Errorf("gha cache: not found for %.8s: %w", commit, err)
 	}
 	if !resp.OK || resp.SignedDownloadURL == "" {
-		return 0, errors.Errorf("gha cache: not found for %.8s", commit)
+		return bundleStatInfo{}, errors.Errorf("gha cache: not found for %.8s", commit)
 	}
-	return 0, nil
+	return bundleStatInfo{}, nil
 }
 
 // get downloads the cache entry.
-func (g *ghaCacheStore) get(ctx context.Context, commit, cacheKey string, _ int64) (io.ReadCloser, error) {
+func (g *ghaCacheStore) get(ctx context.Context, commit, cacheKey string, _ bundleStatInfo) (io.ReadCloser, error) {
 	key := ghaCacheKey(commit, cacheKey)
 	version := ghaCacheVersion(cacheKey)
 
