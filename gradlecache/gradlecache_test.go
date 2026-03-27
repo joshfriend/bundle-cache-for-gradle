@@ -1106,6 +1106,75 @@ func BenchmarkExtract(b *testing.B) {
 	}
 }
 
+// BenchmarkExtractLargeFiles benchmarks the large-file streaming path
+// (files > maxBufferedFileSize = 4 MB). These files are written inline on the
+// reader goroutine via io.Copy rather than being buffered in memory and
+// dispatched to a worker.
+func BenchmarkExtractLargeFiles(b *testing.B) {
+	for _, tc := range []struct {
+		name       string
+		smallFiles int
+		bigFiles   int
+		bigSizeMB  int
+	}{
+		{"100x_8MB", 0, 100, 8},
+		{"1k_small_20x_8MB", 1_000, 20, 8},
+		{"1k_small_5x_32MB", 1_000, 5, 32},
+	} {
+		tc := tc
+		b.Run(tc.name, func(b *testing.B) {
+			bigSize := tc.bigSizeMB << 20
+			smallData := bytes.Repeat([]byte{0x42}, 1024)
+			bigData := bytes.Repeat([]byte{0x55}, bigSize)
+
+			var buf bytes.Buffer
+			tw := archive_tar.NewWriter(&buf)
+			writeE := func(name string, data []byte) {
+				b.Helper()
+				hdr := &archive_tar.Header{
+					Typeflag: archive_tar.TypeReg,
+					Name:     name,
+					Size:     int64(len(data)),
+					Mode:     0o644,
+				}
+				if err := tw.WriteHeader(hdr); err != nil {
+					b.Fatalf("write header: %v", err)
+				}
+				if _, err := tw.Write(data); err != nil {
+					b.Fatalf("write data: %v", err)
+				}
+			}
+			for i := range tc.smallFiles {
+				writeE(fmt.Sprintf("caches/8.14.3/meta/f%d.index", i), smallData)
+			}
+			for i := range tc.bigFiles {
+				writeE(fmt.Sprintf("caches/8.14.3/jars/group%d/fat-%d.jar", i%5, i), bigData)
+			}
+			if err := tw.Close(); err != nil {
+				b.Fatalf("close tar: %v", err)
+			}
+
+			totalBytes := int64(buf.Len())
+			nFiles := tc.smallFiles + tc.bigFiles
+			b.SetBytes(totalBytes)
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for range b.N {
+				iterHome := b.TempDir()
+				iterFn := func(name string) string {
+					return filepath.Join(iterHome, name)
+				}
+				if err := extractTarPlatformRouted(bytes.NewReader(buf.Bytes()), iterFn, false); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(nFiles), "files/op")
+			b.ReportMetric(float64(totalBytes)/1e6, "MB/op")
+		})
+	}
+}
+
 // buildSyntheticTar builds an uncompressed tar archive in memory with
 // smallFiles entries of ~1 KB and largeFiles entries of ~512 KB under caches/,
 // plus 10 configuration-cache entries if includeCC is true. The data is
