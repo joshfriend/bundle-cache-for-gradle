@@ -50,19 +50,19 @@ func DetectStatsdAddr() string {
 func (f *MetricsFlags) NewMetricsClient() MetricsClient {
 	if f.StatsdAddr != "" {
 		if c := NewStatsdClient(f.StatsdAddr, f.MetricsTags); c != nil {
-			slog.Info("metrics: using DogStatsD", "addr", f.StatsdAddr)
+			slog.Debug("metrics: using DogStatsD", "addr", f.StatsdAddr)
 			return c
 		}
 		slog.Warn("failed to connect to DogStatsD, metrics disabled", "addr", f.StatsdAddr)
 		return NoopMetrics{}
 	}
 	if f.DatadogAPIKey != "" {
-		slog.Info("metrics: using Datadog HTTP API")
+		slog.Debug("metrics: using Datadog HTTP API")
 		return NewDatadogAPIClient(f.DatadogAPIKey, f.MetricsTags)
 	}
 	if addr := DetectStatsdAddr(); addr != "" {
 		if c := NewStatsdClient(addr, f.MetricsTags); c != nil {
-			slog.Info("metrics: auto-detected DogStatsD agent", "addr", addr)
+			slog.Debug("metrics: auto-detected DogStatsD agent", "addr", addr)
 			return c
 		}
 	}

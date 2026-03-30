@@ -9,7 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
+
 	"net/http"
 	"net/url"
 	"os"
@@ -53,7 +53,6 @@ func newS3Client(region string) (*s3Client, error) {
 		WriteBufferSize:     128 << 10,
 		ReadBufferSize:      128 << 10,
 	}
-	slog.Debug("s3 client config", "workers", defaultDownloadWorkers, "chunk_mb", defaultDownloadChunkSize>>20)
 	return &s3Client{
 		region:    region,
 		creds:     creds,
