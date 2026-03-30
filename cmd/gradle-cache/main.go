@@ -14,6 +14,8 @@ import (
 	"github.com/joshfriend/gradle-cache-tool/gradlecache"
 )
 
+const gradleUserHomeEnv = "GRADLE_USER_HOME"
+
 // version is set at build time via -ldflags.
 var version = "dev"
 
@@ -73,6 +75,7 @@ type RestoreCmd struct {
 func (c *RestoreCmd) AfterApply() error { return c.validate() }
 
 func (c *RestoreCmd) Run(ctx context.Context, metrics gradlecache.MetricsClient) error {
+	slog.Debug(gradleUserHomeEnv, "path", c.GradleUserHome)
 	return gradlecache.Restore(ctx, gradlecache.RestoreConfig{
 		Bucket:         c.Bucket,
 		Region:         c.Region,
@@ -101,6 +104,7 @@ type RestoreDeltaCmd struct {
 func (c *RestoreDeltaCmd) AfterApply() error { return c.validate() }
 
 func (c *RestoreDeltaCmd) Run(ctx context.Context, metrics gradlecache.MetricsClient) error {
+	slog.Debug(gradleUserHomeEnv, "path", c.GradleUserHome)
 	return gradlecache.RestoreDelta(ctx, gradlecache.RestoreDeltaConfig{
 		Bucket:         c.Bucket,
 		Region:         c.Region,
@@ -126,6 +130,7 @@ type SaveCmd struct {
 func (c *SaveCmd) AfterApply() error { return c.validate() }
 
 func (c *SaveCmd) Run(ctx context.Context, metrics gradlecache.MetricsClient) error {
+	slog.Debug(gradleUserHomeEnv, "path", c.GradleUserHome)
 	return gradlecache.Save(ctx, gradlecache.SaveConfig{
 		Bucket:         c.Bucket,
 		Region:         c.Region,
@@ -151,6 +156,7 @@ type SaveDeltaCmd struct {
 func (c *SaveDeltaCmd) AfterApply() error { return c.validate() }
 
 func (c *SaveDeltaCmd) Run(ctx context.Context, metrics gradlecache.MetricsClient) error {
+	slog.Debug(gradleUserHomeEnv, "path", c.GradleUserHome)
 	return gradlecache.SaveDelta(ctx, gradlecache.SaveDeltaConfig{
 		Bucket:         c.Bucket,
 		Region:         c.Region,
