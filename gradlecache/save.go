@@ -415,6 +415,20 @@ var CacheExclusions = []string{
 	"user-id.txt",
 }
 
+// isHexHash returns true if s is a non-empty string of hex characters (0-9, a-f).
+func isHexHash(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for _, c := range s {
+		isHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+		if !isHex {
+			return false
+		}
+	}
+	return true
+}
+
 // DeltaExclusions are additional file/directory names excluded only from delta
 // bundles. These files are already present in the base bundle and get rewritten
 // every build (Gradle's embedded BTree DB flushes on close even for read-only
@@ -624,41 +638,37 @@ func WriteDeltaTar(w io.Writer, baseDir string, relPaths []string) error {
 	return tw.Close()
 }
 
-// ImmutableWorkspaceParents maps directory names to the depth at which their
-// immutable workspace hash directories live. Depth 1 means the hash dirs are
-// direct children (e.g. transforms/<hash>/). Depth 2 means the hash dirs are
-// one level deeper (e.g. kotlin-dsl/scripts/<hash>/).
+// AtomicCacheParents lists directory names whose descendants include
+// hash-keyed workspace directories that must be captured atomically.
+// The walker recurses through intermediate subdirectories until it finds
+// children whose names look like hex hashes, then treats those as atomic
+// units: if ANY file inside has mtime > marker, ALL files are included.
 //
-// Each workspace is an atomic unit: Gradle creates all files together via an
-// atomic directory rename, and expects all files to be present when reading.
-// However, mtime skew can occur across delta cycles: after restoring base +
-// delta, the base provides output files (old mtime, before the marker) while
-// the delta overwrites metadata files like metadata.bin and results.bin (new
-// mtime, after the marker). A naive per-file mtime check would capture only
-// the metadata files, producing a partial workspace in the next delta. When
-// that partial delta is applied to a different base that lacks the workspace
-// hash, Gradle crashes with "Could not read workspace metadata".
+// These directories contain hash-keyed subdirectories where Gradle expects
+// all files to be present together. Some are true immutable workspaces
+// (transforms, groovy-dsl, kotlin-dsl, dependencies-accessors) created via
+// atomic directory renames. Others are persistent caches with receipt-based
+// completion markers (jars-9). In both cases, a partial directory (e.g.
+// metadata.bin without output files, or a .receipt without the transformed
+// classes) causes Gradle to crash.
 //
-// The fix: when ANY file in a workspace is newer than the marker, include ALL
-// files from that workspace in the delta.
-//
-// Workspace directory structure (relative to caches/<version>/):
-//   - transforms/<hash>/            depth 1 - artifact transforms
-//   - groovy-dsl/<hash>/            depth 1 - compiled Groovy build scripts
-//   - kotlin-dsl/scripts/<hash>/    depth 2 - compiled Kotlin build scripts
-//   - kotlin-dsl/accessors/<hash>/  depth 2 - generated type-safe accessors
-//   - dependencies-accessors/<hash>/ depth 1 - version catalog accessors
-var ImmutableWorkspaceParents = map[string]int{
-	"transforms":             1,
-	"groovy-dsl":             1,
-	"kotlin-dsl":             2,
-	"dependencies-accessors": 1,
+// Mtime skew across delta cycles can produce partial directories: after
+// restoring base + delta, the base provides output files (old mtime) while
+// the delta overwrites metadata/receipt files (new mtime). A per-file mtime
+// check captures only the newer files, producing a partial directory in the
+// next delta. When applied to a base that lacks the hash, Gradle crashes.
+var AtomicCacheParents = map[string]bool{
+	"transforms":             true,
+	"groovy-dsl":             true,
+	"kotlin-dsl":             true,
+	"dependencies-accessors": true,
+	"jars-9":                 true,
 }
 
 // CollectNewFiles walks realCaches in parallel and returns paths of regular files
-// with mtime strictly after since. For directories listed in ImmutableWorkspaceParents,
-// if any file in a child workspace is newer than since, all files in that workspace
-// are included to prevent partial restores.
+// with mtime strictly after since. For directories listed in AtomicCacheParents,
+// if any file in a child hash directory is newer than since, all files in that
+// directory are included to prevent partial restores.
 func CollectNewFiles(realCaches string, since time.Time, gradleHome string) ([]string, error) {
 	workers := min(8, runtime.GOMAXPROCS(0))
 	sem := make(chan struct{}, workers)
@@ -691,12 +701,12 @@ func CollectNewFiles(realCaches string, since time.Time, gradleHome string) ([]s
 	}
 
 	// walkWorkspaceParent handles directories like transforms/ whose children
-	// are atomic workspace directories. depth indicates how many directory levels
-	// below dir the actual hash workspace directories live. When depth > 1
-	// (e.g. kotlin-dsl/scripts/<hash>/), it recurses into intermediate directories
-	// before treating children as atomic workspaces.
-	var walkWorkspaceParent func(dir, rel string, depth int)
-	walkWorkspaceParent = func(dir, rel string, depth int) {
+	// are atomic workspace directories. It auto-detects whether children are
+	// hash-keyed workspaces (hex names) or intermediate directories (like
+	// kotlin-dsl/scripts/). For intermediates, it recurses; for hash dirs,
+	// it checks if any file is new and captures all files atomically.
+	var walkWorkspaceParent func(dir, rel string)
+	walkWorkspaceParent = func(dir, rel string) {
 		defer wg.Done()
 
 		entries, err := os.ReadDir(dir)
@@ -718,11 +728,11 @@ func CollectNewFiles(realCaches string, since time.Time, gradleHome string) ([]s
 			childDir := filepath.Join(dir, entry.Name())
 			childRel := rel + "/" + entry.Name()
 
-			if depth > 1 {
-				// Not yet at the hash workspace level — recurse one level deeper.
+			if !isHexHash(entry.Name()) {
+				// Intermediate directory (e.g. kotlin-dsl/scripts/) — recurse.
 				sem <- struct{}{}
 				wg.Add(1)
-				go walkWorkspaceParent(childDir, childRel, depth-1)
+				go walkWorkspaceParent(childDir, childRel)
 				continue
 			}
 
@@ -740,7 +750,21 @@ func CollectNewFiles(realCaches string, since time.Time, gradleHome string) ([]s
 
 			if hasNew {
 				files := collectAll(childDir, childRel)
-				if len(files) > 0 {
+				// Skip workspace stubs that contain only metadata files
+				// (metadata.bin, results.bin, *.receipt) with no actual
+				// build output. These stubs provide no caching value and
+				// can create broken workspace dirs when applied to a base
+				// that lacks the workspace hash.
+				hasOutput := false
+				for _, f := range files {
+					base := filepath.Base(f)
+					if base != "metadata.bin" && base != "results.bin" &&
+						filepath.Ext(base) != ".receipt" {
+						hasOutput = true
+						break
+					}
+				}
+				if hasOutput {
 					mu.Lock()
 					allFiles = append(allFiles, files...)
 					mu.Unlock()
@@ -776,10 +800,10 @@ func CollectNewFiles(realCaches string, since time.Time, gradleHome string) ([]s
 				if IsExcludedCache(name) || IsDeltaExcluded(name) {
 					continue
 				}
-				if depth, ok := ImmutableWorkspaceParents[name]; ok {
+				if AtomicCacheParents[name] {
 					sem <- struct{}{}
 					wg.Add(1)
-					go walkWorkspaceParent(filepath.Join(dir, name), childRel, depth)
+					go walkWorkspaceParent(filepath.Join(dir, name), childRel)
 				} else {
 					sem <- struct{}{}
 					wg.Add(1)

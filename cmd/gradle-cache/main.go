@@ -12,7 +12,7 @@ import (
 	"github.com/alecthomas/errors"
 	"github.com/alecthomas/kong"
 
-	"github.com/joshfriend/bundle-cache/gradlecache"
+	"github.com/block/bundle-cache/gradlecache"
 )
 
 const gradleUserHomeEnv = "GRADLE_USER_HOME"

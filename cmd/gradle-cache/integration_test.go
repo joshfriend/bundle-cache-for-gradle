@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/block/bundle-cache/gradlecache"
 )
 
 // fakeCachew is a minimal file-backed implementation of the cachew object API
@@ -442,7 +444,7 @@ func must(t *testing.T, err error) {
 // complete immutable workspaces even when only some files have new mtimes.
 //
 // In CI, the base bundle provides workspace output files (old mtime) while the
-// delta overwrites metadata files (new mtime). Without ImmutableWorkspaceParents,
+// delta overwrites metadata files (new mtime). Without AtomicCacheParents,
 // save-delta only captures the metadata → partial workspace. When that delta is
 // applied to a base that lacks the workspace, Gradle crashes with:
 //
@@ -554,7 +556,7 @@ dependencies { implementation("com.google.guava:guava:33.4.0-jre") }
 			// ── Step 3: Simulate mtime skew, save delta ─────────────────
 			// Snapshot workspace file counts before backdating (reference).
 			refWorkspaceDirs := map[string]string{}
-			for _, dirID := range []string{tt.dslCacheID, "transforms"} {
+			for _, dirID := range []string{tt.dslCacheID, "transforms", "jars-9"} {
 				dir := findDslCacheDir(t, ctx.gradleUserHome, dirID)
 				if dir != "" {
 					refWorkspaceDirs[dirID] = dir
@@ -591,13 +593,17 @@ dependencies { implementation("com.google.guava:guava:33.4.0-jre") }
 
 			// Check for partial workspaces by comparing delta vs reference.
 			var corruptCount int
-			for _, dirID := range []string{tt.dslCacheID, "transforms"} {
+			for _, dirID := range []string{tt.dslCacheID, "transforms", "jars-9"} {
 				refDir := refWorkspaceDirs[dirID]
 				deltaDir := findDslCacheDir(t, freshHome, dirID)
-				corruptCount += checkPartialWorkspaces(t, refDir, deltaDir)
+				n := checkPartialWorkspaces(t, refDir, deltaDir)
+				if n > 0 {
+					t.Logf("  %s: %d partial workspace(s)", dirID, n)
+				}
+				corruptCount += n
 			}
 			if corruptCount > 0 {
-				t.Errorf("found %d partial workspace(s) — ImmutableWorkspaceParents not working", corruptCount)
+				t.Errorf("found %d partial workspace(s) — AtomicCacheParents not working", corruptCount)
 			}
 
 			// Also restore base + delta normally and verify Gradle works.
@@ -614,8 +620,9 @@ dependencies { implementation("com.google.guava:guava:33.4.0-jre") }
 
 			output, err := gradleRunMayFail(ctx.projectDir, ctx.gradlew, ctx.gradleUserHome, "assemble")
 			if err != nil {
-				if strings.Contains(output, "metadata.bin") || strings.Contains(output, "workspace metadata") {
-					t.Fatalf("workspace corruption after delta restore:\n%s", output)
+				if strings.Contains(output, "metadata.bin") || strings.Contains(output, "workspace metadata") ||
+					strings.Contains(output, "ClassNotFoundException") || strings.Contains(output, "immutable workspace") {
+					t.Fatalf("cache corruption after delta restore:\n%s", output)
 				}
 				t.Fatalf("Gradle failed after delta restore: %v\n%s", err, output)
 			}
@@ -624,15 +631,16 @@ dependencies { implementation("com.google.guava:guava:33.4.0-jre") }
 	}
 }
 
-// backdateWorkspaceOutputs walks immutable workspace directories (transforms/,
-// groovy-dsl/, kotlin-dsl/) and backdates all non-metadata files to simulate the
-// mtime skew from base+delta extraction. Returns the number of workspaces affected.
+// backdateWorkspaceOutputs walks atomic cache directories (transforms/,
+// groovy-dsl/, kotlin-dsl/, jars-9/) and backdates all non-metadata files to
+// simulate the mtime skew from base+delta extraction. Returns the number of
+// workspaces affected.
 func backdateWorkspaceOutputs(t *testing.T, gradleUserHome, dslCacheID string) int {
 	t.Helper()
 	oldTime := time.Now().Add(-1 * time.Hour)
 	affected := 0
 
-	for _, dirID := range []string{dslCacheID, "transforms"} {
+	for _, dirID := range []string{dslCacheID, "transforms", "jars-9"} {
 		wsParent := findDslCacheDir(t, gradleUserHome, dirID)
 		if wsParent == "" {
 			continue
@@ -649,9 +657,10 @@ func backdateWorkspaceOutputs(t *testing.T, gradleUserHome, dslCacheID string) i
 					return nil
 				}
 				name := d.Name()
-				// Keep metadata.bin and results.bin with current (new) mtime.
+				// Keep metadata/receipt files with current (new) mtime.
 				// Backdate everything else to simulate base-provided output files.
-				if name != "metadata.bin" && name != "results.bin" {
+				if name != "metadata.bin" && name != "results.bin" &&
+					filepath.Ext(name) != ".receipt" {
 					_ = os.Chtimes(path, oldTime, oldTime)
 					backdatedAny = true
 				}
@@ -755,7 +764,7 @@ func workspaceFileCounts(dir string) map[string]int {
 		if isHexHash(name) {
 			n := 0
 			_ = filepath.WalkDir(filepath.Join(dir, name), func(_ string, d os.DirEntry, _ error) error {
-				if d != nil && !d.IsDir() {
+				if d != nil && !d.IsDir() && !gradlecache.IsExcludedCache(d.Name()) {
 					n++
 				}
 				return nil

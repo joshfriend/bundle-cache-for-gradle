@@ -1,4 +1,4 @@
-module github.com/joshfriend/bundle-cache
+module github.com/block/bundle-cache
 
 go 1.25.0
 
