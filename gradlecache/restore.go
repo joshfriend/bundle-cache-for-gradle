@@ -299,7 +299,7 @@ type extractRule struct {
 // entries to their final destinations based on rules.
 func extractBundleZstd(_ context.Context, r io.Reader, rules []extractRule, defaultDir string, skipExisting bool) error {
 	br := bufio.NewReaderSize(r, 8<<20)
-	dec, err := zstd.NewReader(br, zstd.WithDecoderConcurrency(runtime.NumCPU()))
+	dec, err := zstd.NewReader(br, zstd.WithDecoderConcurrency(runtime.GOMAXPROCS(0)))
 	if err != nil {
 		return errors.Wrap(err, "create zstd decoder")
 	}
@@ -325,7 +325,7 @@ func extractBundleZstd(_ context.Context, r io.Reader, rules []extractRule, defa
 
 func extractTarZstd(_ context.Context, r io.Reader, dir string) error {
 	br := bufio.NewReaderSize(r, 8<<20)
-	dec, err := zstd.NewReader(br, zstd.WithDecoderConcurrency(runtime.NumCPU()))
+	dec, err := zstd.NewReader(br, zstd.WithDecoderConcurrency(runtime.GOMAXPROCS(0)))
 	if err != nil {
 		return errors.Wrap(err, "create zstd decoder")
 	}

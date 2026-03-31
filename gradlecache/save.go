@@ -461,7 +461,7 @@ func CreateTarZstd(ctx context.Context, w io.Writer, sources []TarSource) error 
 	}
 
 	enc, err := zstd.NewWriter(w,
-		zstd.WithEncoderConcurrency(runtime.NumCPU()))
+		zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)))
 	if err != nil {
 		return errors.Join(errors.Wrap(err, "create zstd encoder"), tarCmd.Wait())
 	}
@@ -488,7 +488,7 @@ func CreateTarZstd(ctx context.Context, w io.Writer, sources []TarSource) error 
 // relPaths (relative to baseDir).
 func CreateDeltaTarZstd(_ context.Context, w io.Writer, baseDir string, relPaths []string) error {
 	enc, err := zstd.NewWriter(w,
-		zstd.WithEncoderConcurrency(runtime.NumCPU()))
+		zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)))
 	if err != nil {
 		return errors.Wrap(err, "create zstd encoder")
 	}
@@ -564,7 +564,7 @@ var ImmutableWorkspaceParents = map[string]bool{
 // if any file in a child workspace is newer than since, all files in that workspace
 // are included to prevent partial restores.
 func CollectNewFiles(realCaches string, since time.Time, gradleHome string) ([]string, error) {
-	workers := min(8, runtime.NumCPU())
+	workers := min(8, runtime.GOMAXPROCS(0))
 	sem := make(chan struct{}, workers)
 
 	var mu sync.Mutex
