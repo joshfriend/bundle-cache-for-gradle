@@ -65,7 +65,7 @@ func (f *backendFlags) validate() error {
 type RestoreCmd struct {
 	backendFlags
 	CacheKey       string   `help:"Bundle identifier, e.g. 'my-project:assembleRelease'." required:""`
-	GitDir         string   `help:"Path to the git repository used for history walking." default:"." type:"path"`
+	GitDir         string   `help:"Path to the git repository used for history walking." default:"." type:"path" hidden:""`
 	Ref            string   `help:"Git ref used to search for a base bundle. When --branch is set, history walks from the merge-base of HEAD and this ref." default:"HEAD"`
 	Commit         string   `help:"Specific commit SHA to try directly, skipping history walk."`
 	MaxBlocks      int      `help:"Number of distinct-author commit blocks to search." default:"20"`
@@ -128,7 +128,7 @@ type SaveCmd struct {
 	backendFlags
 	CacheKey       string   `help:"Bundle identifier, e.g. 'my-project:assembleRelease'." required:""`
 	Commit         string   `help:"Commit SHA to tag this bundle with. Defaults to HEAD of --git-dir."`
-	GitDir         string   `help:"Path to the git repository." default:"." type:"path"`
+	GitDir         string   `help:"Path to the git repository." default:"." type:"path" hidden:""`
 	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME" type:"path"`
 	IncludedBuilds []string `help:"Included build directories whose build/ output to archive. May be repeated." name:"included-build" type:"path"`
 }
