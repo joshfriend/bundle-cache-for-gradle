@@ -556,7 +556,7 @@ dependencies { implementation("com.google.guava:guava:33.4.0-jre") }
 			// ── Step 3: Simulate mtime skew, save delta ─────────────────
 			// Snapshot workspace file counts before backdating (reference).
 			refWorkspaceDirs := map[string]string{}
-			for _, dirID := range []string{tt.dslCacheID, "transforms", "jars-9"} {
+			for _, dirID := range []string{tt.dslCacheID, "transforms", "jars-9", "dependencies-accessors"} {
 				dir := findDslCacheDir(t, ctx.gradleUserHome, dirID)
 				if dir != "" {
 					refWorkspaceDirs[dirID] = dir
@@ -593,7 +593,7 @@ dependencies { implementation("com.google.guava:guava:33.4.0-jre") }
 
 			// Check for partial workspaces by comparing delta vs reference.
 			var corruptCount int
-			for _, dirID := range []string{tt.dslCacheID, "transforms", "jars-9"} {
+			for _, dirID := range []string{tt.dslCacheID, "transforms", "jars-9", "dependencies-accessors"} {
 				refDir := refWorkspaceDirs[dirID]
 				deltaDir := findDslCacheDir(t, freshHome, dirID)
 				n := checkPartialWorkspaces(t, refDir, deltaDir)
@@ -640,7 +640,7 @@ func backdateWorkspaceOutputs(t *testing.T, gradleUserHome, dslCacheID string) i
 	oldTime := time.Now().Add(-1 * time.Hour)
 	affected := 0
 
-	for _, dirID := range []string{dslCacheID, "transforms", "jars-9"} {
+	for _, dirID := range []string{dslCacheID, "transforms", "jars-9", "dependencies-accessors"} {
 		wsParent := findDslCacheDir(t, gradleUserHome, dirID)
 		if wsParent == "" {
 			continue

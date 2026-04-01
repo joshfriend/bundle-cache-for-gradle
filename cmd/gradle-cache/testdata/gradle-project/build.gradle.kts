@@ -7,7 +7,7 @@ repositories {
 }
 
 dependencies {
-    testImplementation(kotlin("test"))
+    testImplementation(libs.kotlin.test)
 }
 
 tasks.test {
