@@ -98,9 +98,11 @@ func (c *RestoreCmd) Run(ctx context.Context, metrics gradlecache.MetricsClient)
 
 type RestoreDeltaCmd struct {
 	backendFlags
-	CacheKey       string `help:"Bundle identifier, e.g. 'my-project:assembleRelease'." required:""`
-	Branch         string `help:"Branch name to look up a delta for." required:""`
-	GradleUserHome string `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME"`
+	CacheKey       string   `help:"Bundle identifier, e.g. 'my-project:assembleRelease'." required:""`
+	Branch         string   `help:"Branch name to look up a delta for." required:""`
+	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME"`
+	ProjectDir     string   `help:"Project directory for routing project-specific cache entries." type:"path"`
+	IncludedBuilds []string `help:"Included build directories whose build/ output to route. May be repeated." name:"included-build"`
 }
 
 func (c *RestoreDeltaCmd) AfterApply() error { return c.validate() }
@@ -114,6 +116,8 @@ func (c *RestoreDeltaCmd) Run(ctx context.Context, metrics gradlecache.MetricsCl
 		CacheKey:       c.CacheKey,
 		Branch:         c.Branch,
 		GradleUserHome: c.GradleUserHome,
+		ProjectDir:     c.ProjectDir,
+		IncludedBuilds: c.IncludedBuilds,
 		Metrics:        metrics,
 	})
 }
@@ -150,9 +154,11 @@ func (c *SaveCmd) Run(ctx context.Context, metrics gradlecache.MetricsClient) er
 
 type SaveDeltaCmd struct {
 	backendFlags
-	CacheKey       string `help:"Bundle identifier, e.g. 'my-project:assembleRelease'." required:""`
-	Branch         string `help:"Branch name to save the delta under." required:""`
-	GradleUserHome string `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME"`
+	CacheKey       string   `help:"Bundle identifier, e.g. 'my-project:assembleRelease'." required:""`
+	Branch         string   `help:"Branch name to save the delta under." required:""`
+	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME"`
+	ProjectDir     string   `help:"Project directory to scan for project-specific cache changes." type:"path"`
+	IncludedBuilds []string `help:"Included build directories whose build/ output to include in delta. May be repeated." name:"included-build"`
 }
 
 func (c *SaveDeltaCmd) AfterApply() error { return c.validate() }
@@ -166,6 +172,8 @@ func (c *SaveDeltaCmd) Run(ctx context.Context, metrics gradlecache.MetricsClien
 		CacheKey:       c.CacheKey,
 		Branch:         c.Branch,
 		GradleUserHome: c.GradleUserHome,
+		ProjectDir:     c.ProjectDir,
+		IncludedBuilds: c.IncludedBuilds,
 		Metrics:        metrics,
 	})
 }

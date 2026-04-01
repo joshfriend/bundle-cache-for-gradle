@@ -2,6 +2,7 @@ package gradlecache
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -28,6 +29,8 @@ type RestoreDeltaConfig struct {
 	CacheKey       string
 	Branch         string
 	GradleUserHome string
+	ProjectDir     string   // optional: route project-dir entries to their correct locations
+	IncludedBuilds []string // included build directories (for convention plugin outputs)
 	Metrics        MetricsClient
 	Logger         *slog.Logger
 }
@@ -79,8 +82,13 @@ func RestoreDelta(ctx context.Context, cfg RestoreDeltaConfig) error {
 	}
 	defer body.Close() //nolint:errcheck,gosec
 
+	var pdSources []TarSource
+	if cfg.ProjectDir != "" {
+		pdSources = ProjectDirSources(cfg.ProjectDir, cfg.IncludedBuilds)
+	}
+
 	cb := &countingBody{r: body, dlStart: dlStart}
-	if err := extractTarZstd(ctx, cb, cfg.GradleUserHome); err != nil {
+	if err := extractDeltaTarZstd(ctx, cb, cfg.GradleUserHome, pdSources); err != nil {
 		return errors.Wrap(err, "extract delta bundle")
 	}
 
@@ -250,6 +258,8 @@ type SaveDeltaConfig struct {
 	CacheKey       string
 	Branch         string
 	GradleUserHome string
+	ProjectDir     string   // optional: scan project-dir sources for new entries
+	IncludedBuilds []string // included build directories (for convention plugin outputs)
 	Metrics        MetricsClient
 	Logger         *slog.Logger
 }
@@ -299,7 +309,26 @@ func SaveDelta(ctx context.Context, cfg SaveDeltaConfig) error {
 		"duration", time.Since(scanStart).Round(time.Millisecond),
 		"new_files", len(newFiles))
 
-	if len(newFiles) == 0 {
+	// Collect new files from project-dir sources (configuration-cache, included builds).
+	var projectSources []DeltaSource
+	if cfg.ProjectDir != "" {
+		for _, src := range ProjectDirSources(cfg.ProjectDir, cfg.IncludedBuilds) {
+			newProjectFiles := collectNewFilesSimple(
+				filepath.Join(src.BaseDir, src.Path), src.BaseDir, since)
+			if len(newProjectFiles) > 0 {
+				log.Debug("project source scan complete", "path", src.Path, "new_files", len(newProjectFiles))
+				projectSources = append(projectSources, DeltaSource{
+					BaseDir: src.BaseDir, RelPaths: newProjectFiles,
+				})
+			}
+		}
+	}
+
+	projectFileCount := 0
+	for _, s := range projectSources {
+		projectFileCount += len(s.RelPaths)
+	}
+	if len(newFiles) == 0 && projectFileCount == 0 {
 		log.Info("no new cache files since restore, skipping delta save")
 		return nil
 	}
@@ -318,11 +347,13 @@ func SaveDelta(ctx context.Context, cfg SaveDeltaConfig) error {
 		os.Remove(tmp.Name()) //nolint:errcheck,gosec
 	}()
 
+	totalFiles := len(newFiles) + projectFileCount
 	dc := deltaCommit(cfg.Branch)
-	log.Info("saving delta bundle", "branch", cfg.Branch, "cache-key", cfg.CacheKey, "files", len(newFiles))
+	log.Info("saving delta bundle", "branch", cfg.Branch, "cache-key", cfg.CacheKey, "files", totalFiles)
 	saveStart := time.Now()
 
-	if err := CreateDeltaTarZstd(ctx, tmp, cfg.GradleUserHome, newFiles); err != nil {
+	sources := append([]DeltaSource{{BaseDir: cfg.GradleUserHome, RelPaths: newFiles}}, projectSources...)
+	if err := CreateDeltaTarZstdMulti(tmp, sources...); err != nil {
 		return errors.Wrap(err, "create delta archive")
 	}
 
@@ -584,16 +615,91 @@ func createTarKlauspost(ctx context.Context, w io.Writer, tarArgs []string) erro
 	return errors.Join(errs...)
 }
 
+// extractDeltaTarZstd extracts a delta bundle. When projectDirSources is
+// non-empty, entries matching those prefixes are routed to their respective
+// base directories; everything else goes to gradleUserHome.
+func extractDeltaTarZstd(ctx context.Context, r io.Reader, gradleUserHome string, projectDirSources []TarSource) error {
+	if len(projectDirSources) == 0 {
+		return extractTarZstd(ctx, r, gradleUserHome)
+	}
+	br := bufio.NewReaderSize(r, 8<<20)
+	dec, err := zstd.NewReader(br, zstd.WithDecoderConcurrency(runtime.GOMAXPROCS(0)))
+	if err != nil {
+		return errors.Wrap(err, "create zstd decoder")
+	}
+	defer dec.Close()
+
+	// Build routing rules from project-dir sources.
+	type route struct {
+		prefix  string
+		baseDir string
+	}
+	var routes []route
+	for _, src := range projectDirSources {
+		// src.Path is like "./configuration-cache" — strip leading "./"
+		prefix := strings.TrimPrefix(src.Path, "./") + "/"
+		routes = append(routes, route{prefix: prefix, baseDir: src.BaseDir})
+	}
+
+	targetFn := func(name string) string {
+		for _, r := range routes {
+			if strings.HasPrefix(name, r.prefix) {
+				return filepath.Join(r.baseDir, name)
+			}
+		}
+		return filepath.Join(gradleUserHome, name)
+	}
+	if err := extractTarPlatformRouted(dec, targetFn, false); err != nil {
+		return err
+	}
+	return drainCompressedReader(br)
+}
+
+// collectNewFilesSimple walks dir for regular files with mtime after since,
+// returning paths relative to baseDir.
+func collectNewFilesSimple(dir, baseDir string, since time.Time) []string {
+	var files []string
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if info.ModTime().After(since) {
+			rel, _ := filepath.Rel(baseDir, path)
+			files = append(files, rel)
+		}
+		return nil
+	})
+	return files
+}
+
+// DeltaSource groups files from a single base directory for delta archiving.
+type DeltaSource struct {
+	BaseDir  string
+	RelPaths []string
+}
+
 // CreateDeltaTarZstd creates a zstd-compressed tar archive containing the files at
 // relPaths (relative to baseDir).
 func CreateDeltaTarZstd(_ context.Context, w io.Writer, baseDir string, relPaths []string) error {
+	return CreateDeltaTarZstdMulti(w, DeltaSource{BaseDir: baseDir, RelPaths: relPaths})
+}
+
+// CreateDeltaTarZstdMulti creates a zstd-compressed tar archive from multiple sources.
+func CreateDeltaTarZstdMulti(w io.Writer, sources ...DeltaSource) error {
 	enc, err := zstd.NewWriter(w,
 		zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)))
 	if err != nil {
 		return errors.Wrap(err, "create zstd encoder")
 	}
 
-	tarErr := WriteDeltaTar(enc, baseDir, relPaths)
+	tarErr := WriteDeltaTarMulti(enc, sources...)
 	encErr := enc.Close()
 
 	return errors.Join(tarErr, encErr)
@@ -601,41 +707,55 @@ func CreateDeltaTarZstd(_ context.Context, w io.Writer, baseDir string, relPaths
 
 // WriteDeltaTar writes a tar stream for the specified files to w.
 func WriteDeltaTar(w io.Writer, baseDir string, relPaths []string) error {
+	return WriteDeltaTarMulti(w, DeltaSource{BaseDir: baseDir, RelPaths: relPaths})
+}
+
+// WriteDeltaTarMulti writes a tar stream for files from multiple source directories.
+func WriteDeltaTarMulti(w io.Writer, sources ...DeltaSource) error {
 	tw := tar.NewWriter(w)
-	for _, rel := range relPaths {
-		absPath := filepath.Join(baseDir, rel)
-		fi, err := os.Lstat(absPath)
-		if os.IsNotExist(err) {
-			continue
-		}
-		if err != nil {
-			return errors.Errorf("stat %s: %w", rel, err)
-		}
-		if !fi.Mode().IsRegular() {
-			continue
-		}
-
-		hdr, err := tar.FileInfoHeader(fi, "")
-		if err != nil {
-			return errors.Errorf("tar header for %s: %w", rel, err)
-		}
-		hdr.Name = rel
-
-		if err := tw.WriteHeader(hdr); err != nil {
-			return errors.Errorf("write tar header %s: %w", rel, err)
-		}
-
-		f, err := os.Open(absPath)
-		if err != nil {
-			return errors.Errorf("open %s: %w", rel, err)
-		}
-		_, copyErr := io.Copy(tw, f)
-		f.Close() //nolint:errcheck,gosec
-		if copyErr != nil {
-			return errors.Errorf("copy %s: %w", rel, copyErr)
+	for _, src := range sources {
+		for _, rel := range src.RelPaths {
+			if err := writeDeltaTarEntry(tw, src.BaseDir, rel); err != nil {
+				return err
+			}
 		}
 	}
 	return tw.Close()
+}
+
+func writeDeltaTarEntry(tw *tar.Writer, baseDir, rel string) error {
+	absPath := filepath.Join(baseDir, rel)
+	fi, err := os.Lstat(absPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return errors.Errorf("stat %s: %w", rel, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil
+	}
+
+	hdr, err := tar.FileInfoHeader(fi, "")
+	if err != nil {
+		return errors.Errorf("tar header for %s: %w", rel, err)
+	}
+	hdr.Name = rel
+
+	if err := tw.WriteHeader(hdr); err != nil {
+		return errors.Errorf("write tar header %s: %w", rel, err)
+	}
+
+	f, err := os.Open(absPath)
+	if err != nil {
+		return errors.Errorf("open %s: %w", rel, err)
+	}
+	_, copyErr := io.Copy(tw, f)
+	f.Close() //nolint:errcheck,gosec
+	if copyErr != nil {
+		return errors.Errorf("copy %s: %w", rel, copyErr)
+	}
+	return nil
 }
 
 // AtomicCacheParents lists directory names whose descendants include

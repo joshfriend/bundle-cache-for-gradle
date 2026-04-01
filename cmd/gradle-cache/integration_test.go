@@ -573,6 +573,7 @@ dependencies { implementation("com.google.guava:guava:33.4.0-jre") }
 				"--cache-key", ctx.cacheKey,
 				"--branch", "test-branch",
 				"--gradle-user-home", ctx.gradleUserHome,
+				"--project-dir", ctx.projectDir,
 			)
 			runCLI(t, binaryPath, ctx, saveDeltaArgs...)
 
@@ -588,6 +589,7 @@ dependencies { implementation("com.google.guava:guava:33.4.0-jre") }
 				"--cache-key", ctx.cacheKey,
 				"--branch", "test-branch",
 				"--gradle-user-home", freshHome,
+				"--project-dir", ctx.projectDir,
 			)
 			runCLI(t, binaryPath, ctx, freshRestoreDelta...)
 
@@ -615,6 +617,7 @@ dependencies { implementation("com.google.guava:guava:33.4.0-jre") }
 				"--cache-key", ctx.cacheKey,
 				"--branch", "test-branch",
 				"--gradle-user-home", ctx.gradleUserHome,
+				"--project-dir", ctx.projectDir,
 			)
 			runCLI(t, binaryPath, ctx, fullRestoreDelta...)
 
@@ -802,6 +805,144 @@ func gradleRunMayFail(projectDir, gradlew, gradleUserHome string, tasks ...strin
 	cmd.Env = gradleEnv(gradleUserHome)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// TestIntegrationDeltaConfigurationCache verifies that delta bundles can capture
+// and restore configuration cache entries. The flow:
+//  1. Build once, save the base bundle (includes initial configuration cache)
+//  2. Restore base, modify build.gradle, rebuild (creates new CC entry)
+//  3. Save delta with --project-dir (captures CC changes)
+//  4. Wipe all state, restore base + delta with --project-dir
+//  5. Verify Gradle reuses the configuration cache (not stored fresh)
+func TestIntegrationDeltaConfigurationCache(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	for _, tool := range []string{"java", "tar"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not available", tool)
+		}
+	}
+
+	binaryPath := filepath.Join(t.TempDir(), "gradle-cache")
+	buildCmd := exec.Command("go", "build", "-o", binaryPath, ".")
+	buildCmd.Dir = "."
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+
+	for _, tt := range []struct {
+		name      string
+		fixture   string
+		buildFile string
+		change    string // appended to build file to invalidate CC
+	}{
+		{
+			name:      "groovy-dsl",
+			fixture:   "groovy-project",
+			buildFile: "build.gradle",
+			change:    "\n// force CC invalidation\n",
+		},
+		{
+			name:      "kotlin-dsl",
+			fixture:   "gradle-project",
+			buildFile: "build.gradle.kts",
+			change:    "\n// force CC invalidation\n",
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			backend, cleanupBackend := backendArgs(t)
+			defer cleanupBackend()
+
+			ctx := integrationContextFrom(t, tt.fixture)
+
+			// ── Step 1: Build and save base bundle ──────────────────────
+			t.Log("Step 1: Building and saving base bundle...")
+			gradleRun(t, ctx.projectDir, ctx.gradlew, ctx.gradleUserHome, "build")
+			commitSHA := gitRevParse(t, ctx.projectDir)
+
+			saveArgs := append([]string{"--log-level", "debug", "save"}, backend...)
+			saveArgs = append(saveArgs,
+				"--cache-key", ctx.cacheKey,
+				"--commit", commitSHA,
+				"--gradle-user-home", ctx.gradleUserHome,
+			)
+			runCLI(t, binaryPath, ctx, saveArgs...)
+
+			// ── Step 2: Restore base, modify build file, rebuild ────────
+			t.Log("Step 2: Restoring base, modifying build file, rebuilding...")
+			clearGradleState(t, ctx)
+
+			restoreArgs := append([]string{"--log-level", "debug", "restore"}, backend...)
+			restoreArgs = append(restoreArgs,
+				"--cache-key", ctx.cacheKey,
+				"--ref", commitSHA,
+				"--git-dir", ctx.projectDir,
+				"--gradle-user-home", ctx.gradleUserHome,
+			)
+			runCLI(t, binaryPath, ctx, restoreArgs...)
+
+			// Modify build file to invalidate configuration cache.
+			buildFilePath := filepath.Join(ctx.projectDir, tt.buildFile)
+			f, err := os.OpenFile(buildFilePath, os.O_APPEND|os.O_WRONLY, 0o644)
+			must(t, err)
+			_, err = f.WriteString(tt.change)
+			must(t, err)
+			must(t, f.Close())
+
+			output := gradleRun(t, ctx.projectDir, ctx.gradlew, ctx.gradleUserHome, "build")
+			if !strings.Contains(output, "Calculating task graph") &&
+				!strings.Contains(output, "configuration cache") {
+				t.Log("  Note: could not confirm CC was recalculated on modified build")
+			}
+
+			// ── Step 3: Save delta with --project-dir ───────────────────
+			t.Log("Step 3: Saving delta with configuration cache entries...")
+			saveDeltaArgs := append([]string{"--log-level", "debug", "save-delta"}, backend...)
+			saveDeltaArgs = append(saveDeltaArgs,
+				"--cache-key", ctx.cacheKey,
+				"--branch", "cc-test-branch",
+				"--gradle-user-home", ctx.gradleUserHome,
+				"--project-dir", ctx.projectDir,
+			)
+			runCLI(t, binaryPath, ctx, saveDeltaArgs...)
+
+			// ── Step 4: Wipe state, restore base + delta ────────────────
+			t.Log("Step 4: Wiping state, restoring base + delta...")
+			clearGradleState(t, ctx)
+			runCLI(t, binaryPath, ctx, restoreArgs...)
+
+			restoreDeltaArgs := append([]string{"--log-level", "debug", "restore-delta"}, backend...)
+			restoreDeltaArgs = append(restoreDeltaArgs,
+				"--cache-key", ctx.cacheKey,
+				"--branch", "cc-test-branch",
+				"--gradle-user-home", ctx.gradleUserHome,
+				"--project-dir", ctx.projectDir,
+			)
+			runCLI(t, binaryPath, ctx, restoreDeltaArgs...)
+
+			// Verify configuration-cache dir was restored.
+			ccDir := filepath.Join(ctx.projectDir, ".gradle", "configuration-cache")
+			if _, err := os.Stat(ccDir); err != nil {
+				t.Fatalf("configuration-cache dir not restored: %v", err)
+			}
+
+			// ── Step 5: Verify CC hit with the modified build file ──────
+			t.Log("Step 5: Verifying configuration cache hit...")
+			output = gradleRun(t, ctx.projectDir, ctx.gradlew, ctx.gradleUserHome, "build")
+
+			if strings.Contains(output, "Reusing configuration cache") {
+				t.Log("  Configuration cache: reused ✓")
+			} else {
+				ccLine := extractLine(output, "configuration cache")
+				t.Logf("  Configuration cache line: %s", ccLine)
+				if strings.Contains(ccLine, "stored") {
+					t.Error("expected configuration cache to be reused after delta restore, but it was stored fresh")
+				}
+			}
+		})
+	}
 }
 
 func extractLine(output, substr string) string {
