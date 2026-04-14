@@ -1,0 +1,12 @@
+plugins {
+    id 'java-gradle-plugin'
+}
+
+gradlePlugin {
+    plugins {
+        included {
+            id = 'com.example.included'
+            implementationClass = 'com.example.IncludedPlugin'
+        }
+    }
+}

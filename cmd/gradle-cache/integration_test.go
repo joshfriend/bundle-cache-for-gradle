@@ -150,6 +150,7 @@ func TestIntegrationGradleBuildCycle(t *testing.T) {
 		"--cache-key", ctx.cacheKey,
 		"--commit", commitSHA,
 		"--gradle-user-home", ctx.gradleUserHome,
+		"--included-build", "build-logic",
 	)
 	runCLI(t, binaryPath, ctx, saveArgs...)
 
@@ -164,10 +165,15 @@ func TestIntegrationGradleBuildCycle(t *testing.T) {
 		"--ref", commitSHA,
 		"--git-dir", ctx.projectDir,
 		"--gradle-user-home", ctx.gradleUserHome,
+		"--included-build", "build-logic",
 	)
 	runCLI(t, binaryPath, ctx, restoreArgs...)
 
 	t.Log("Step 4: Verifying restore...")
+	buildLogicBuildDir := filepath.Join(ctx.projectDir, "build-logic", "build")
+	if _, err := os.Stat(buildLogicBuildDir); err != nil {
+		t.Fatal("build-logic/build/ was NOT restored")
+	}
 	verifyRestore(t, ctx)
 }
 
@@ -525,6 +531,7 @@ dependencies { implementation("com.google.guava:guava:33.4.0-jre") }
 				"--cache-key", ctx.cacheKey,
 				"--commit", commitSHA,
 				"--gradle-user-home", ctx.gradleUserHome,
+				"--included-build", "build-logic",
 			)
 			runCLI(t, binaryPath, ctx, saveArgs...)
 
@@ -537,6 +544,7 @@ dependencies { implementation("com.google.guava:guava:33.4.0-jre") }
 				"--ref", commitSHA,
 				"--git-dir", ctx.projectDir,
 				"--gradle-user-home", ctx.gradleUserHome,
+				"--included-build", "build-logic",
 			)
 			runCLI(t, binaryPath, ctx, restoreArgs...)
 
@@ -574,6 +582,7 @@ dependencies { implementation("com.google.guava:guava:33.4.0-jre") }
 				"--branch", "test-branch",
 				"--gradle-user-home", ctx.gradleUserHome,
 				"--project-dir", ctx.projectDir,
+				"--included-build", "build-logic",
 			)
 			runCLI(t, binaryPath, ctx, saveDeltaArgs...)
 
@@ -590,6 +599,7 @@ dependencies { implementation("com.google.guava:guava:33.4.0-jre") }
 				"--branch", "test-branch",
 				"--gradle-user-home", freshHome,
 				"--project-dir", ctx.projectDir,
+				"--included-build", "build-logic",
 			)
 			runCLI(t, binaryPath, ctx, freshRestoreDelta...)
 
@@ -618,6 +628,7 @@ dependencies { implementation("com.google.guava:guava:33.4.0-jre") }
 				"--branch", "test-branch",
 				"--gradle-user-home", ctx.gradleUserHome,
 				"--project-dir", ctx.projectDir,
+				"--included-build", "build-logic",
 			)
 			runCLI(t, binaryPath, ctx, fullRestoreDelta...)
 
@@ -832,22 +843,42 @@ func TestIntegrationDeltaConfigurationCache(t *testing.T) {
 	}
 
 	for _, tt := range []struct {
-		name      string
-		fixture   string
-		buildFile string
-		change    string // appended to build file to invalidate CC
+		name    string
+		fixture string
+		mutate  func(t *testing.T, projectDir string) // invalidate CC
 	}{
 		{
-			name:      "groovy-dsl",
-			fixture:   "groovy-project",
-			buildFile: "build.gradle",
-			change:    "\n// force CC invalidation\n",
+			name:    "groovy-dsl",
+			fixture: "groovy-project",
+			mutate: func(t *testing.T, projectDir string) {
+				appendToFile(t, filepath.Join(projectDir, "build.gradle"), "\n// force CC invalidation\n")
+			},
 		},
 		{
-			name:      "kotlin-dsl",
-			fixture:   "gradle-project",
-			buildFile: "build.gradle.kts",
-			change:    "\n// force CC invalidation\n",
+			name:    "kotlin-dsl",
+			fixture: "gradle-project",
+			mutate: func(t *testing.T, projectDir string) {
+				appendToFile(t, filepath.Join(projectDir, "build.gradle.kts"), "\n// force CC invalidation\n")
+			},
+		},
+		{
+			name:    "included-build-plugin-change",
+			fixture: "gradle-project",
+			mutate: func(t *testing.T, projectDir string) {
+				must(t, os.WriteFile(
+					filepath.Join(projectDir, "build-logic", "src", "main", "java", "com", "example", "IncludedPlugin.java"),
+					[]byte(`package com.example;
+
+import org.gradle.api.Plugin;
+import org.gradle.api.Project;
+
+public class IncludedPlugin implements Plugin<Project> {
+    @Override public void apply(Project project) {
+        project.getLogger().lifecycle("IncludedPlugin applied (modified)");
+    }
+}
+`), 0o644))
+			},
 		},
 	} {
 		tt := tt
@@ -867,6 +898,7 @@ func TestIntegrationDeltaConfigurationCache(t *testing.T) {
 				"--cache-key", ctx.cacheKey,
 				"--commit", commitSHA,
 				"--gradle-user-home", ctx.gradleUserHome,
+				"--included-build", "build-logic",
 			)
 			runCLI(t, binaryPath, ctx, saveArgs...)
 
@@ -880,16 +912,12 @@ func TestIntegrationDeltaConfigurationCache(t *testing.T) {
 				"--ref", commitSHA,
 				"--git-dir", ctx.projectDir,
 				"--gradle-user-home", ctx.gradleUserHome,
+				"--included-build", "build-logic",
 			)
 			runCLI(t, binaryPath, ctx, restoreArgs...)
 
-			// Modify build file to invalidate configuration cache.
-			buildFilePath := filepath.Join(ctx.projectDir, tt.buildFile)
-			f, err := os.OpenFile(buildFilePath, os.O_APPEND|os.O_WRONLY, 0o644)
-			must(t, err)
-			_, err = f.WriteString(tt.change)
-			must(t, err)
-			must(t, f.Close())
+			// Mutate the project to invalidate configuration cache.
+			tt.mutate(t, ctx.projectDir)
 
 			output := gradleRun(t, ctx.projectDir, ctx.gradlew, ctx.gradleUserHome, "build")
 			if !strings.Contains(output, "Calculating task graph") &&
@@ -905,6 +933,7 @@ func TestIntegrationDeltaConfigurationCache(t *testing.T) {
 				"--branch", "cc-test-branch",
 				"--gradle-user-home", ctx.gradleUserHome,
 				"--project-dir", ctx.projectDir,
+				"--included-build", "build-logic",
 			)
 			runCLI(t, binaryPath, ctx, saveDeltaArgs...)
 
@@ -919,6 +948,7 @@ func TestIntegrationDeltaConfigurationCache(t *testing.T) {
 				"--branch", "cc-test-branch",
 				"--gradle-user-home", ctx.gradleUserHome,
 				"--project-dir", ctx.projectDir,
+				"--included-build", "build-logic",
 			)
 			runCLI(t, binaryPath, ctx, restoreDeltaArgs...)
 
@@ -928,7 +958,7 @@ func TestIntegrationDeltaConfigurationCache(t *testing.T) {
 				t.Fatalf("configuration-cache dir not restored: %v", err)
 			}
 
-			// ── Step 5: Verify CC hit with the modified build file ──────
+			// ── Step 5: Verify CC hit after delta restore ──────────────
 			t.Log("Step 5: Verifying configuration cache hit...")
 			output = gradleRun(t, ctx.projectDir, ctx.gradlew, ctx.gradleUserHome, "build")
 
@@ -943,6 +973,15 @@ func TestIntegrationDeltaConfigurationCache(t *testing.T) {
 			}
 		})
 	}
+}
+
+func appendToFile(t *testing.T, path, content string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	must(t, err)
+	_, err = f.WriteString(content)
+	must(t, err)
+	must(t, f.Close())
 }
 
 func extractLine(output, substr string) string {

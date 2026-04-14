@@ -4,10 +4,13 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/pprof"
+	"strings"
 
 	"github.com/alecthomas/errors"
 	"github.com/alecthomas/kong"
@@ -61,6 +64,25 @@ func (f *backendFlags) validate() error {
 	return nil
 }
 
+// validateIncludedBuilds checks that each --included-build value refers to an
+// existing directory (or, for glob patterns like "build-logic/*", that the
+// parent directory exists). baseDir is the directory paths are resolved
+// against (typically the project directory).
+func validateIncludedBuilds(baseDir string, entries []string) error {
+	for _, entry := range entries {
+		dir := strings.TrimSuffix(entry, "/*")
+		path := filepath.Join(baseDir, dir)
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("--included-build %q: %w", entry, err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("--included-build %q: not a directory", entry)
+		}
+	}
+	return nil
+}
+
 // ── Restore ─────────────────────────────────────────────────────────────────
 
 type RestoreCmd struct {
@@ -71,11 +93,17 @@ type RestoreCmd struct {
 	Commit         string   `help:"Specific commit SHA to try directly, skipping history walk."`
 	MaxBlocks      int      `help:"Number of distinct-author commit blocks to search." default:"20"`
 	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME" type:"path"`
-	IncludedBuilds []string `help:"Included build directories whose build/ output to restore. May be repeated." name:"included-build" type:"path"`
+	ProjectDir     string   `help:"Project directory containing included builds and .gradle/." default:"." type:"path"`
+	IncludedBuilds []string `help:"Included build directories whose build/ output to restore. May be repeated." name:"included-build"`
 	Branch         string   `help:"Branch name to also apply a delta bundle for." optional:""`
 }
 
-func (c *RestoreCmd) AfterApply() error { return c.validate() }
+func (c *RestoreCmd) AfterApply() error {
+	if err := c.validate(); err != nil {
+		return err
+	}
+	return validateIncludedBuilds(c.ProjectDir, c.IncludedBuilds)
+}
 
 func (c *RestoreCmd) Run(ctx context.Context, metrics gradlecache.MetricsClient) error {
 	slog.Debug(gradleUserHomeEnv, "path", c.GradleUserHome)
@@ -90,6 +118,7 @@ func (c *RestoreCmd) Run(ctx context.Context, metrics gradlecache.MetricsClient)
 		Commit:         c.Commit,
 		MaxBlocks:      c.MaxBlocks,
 		GradleUserHome: c.GradleUserHome,
+		ProjectDir:     c.ProjectDir,
 		IncludedBuilds: c.IncludedBuilds,
 		Branch:         c.Branch,
 		Metrics:        metrics,
@@ -104,10 +133,15 @@ type RestoreDeltaCmd struct {
 	Branch         string   `help:"Branch name to look up a delta for." required:""`
 	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME" type:"path"`
 	ProjectDir     string   `help:"Project directory for routing project-specific cache entries." type:"path"`
-	IncludedBuilds []string `help:"Included build directories whose build/ output to route. May be repeated." name:"included-build" type:"path"`
+	IncludedBuilds []string `help:"Included build directories whose build/ output to route. May be repeated." name:"included-build"`
 }
 
-func (c *RestoreDeltaCmd) AfterApply() error { return c.validate() }
+func (c *RestoreDeltaCmd) AfterApply() error {
+	if err := c.validate(); err != nil {
+		return err
+	}
+	return validateIncludedBuilds(c.ProjectDir, c.IncludedBuilds)
+}
 
 func (c *RestoreDeltaCmd) Run(ctx context.Context, metrics gradlecache.MetricsClient) error {
 	slog.Debug(gradleUserHomeEnv, "path", c.GradleUserHome)
@@ -133,10 +167,16 @@ type SaveCmd struct {
 	Commit         string   `help:"Commit SHA to tag this bundle with. Defaults to HEAD of --git-dir."`
 	GitDir         string   `help:"Path to the git repository." default:"." type:"path" hidden:""`
 	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME" type:"path"`
-	IncludedBuilds []string `help:"Included build directories whose build/ output to archive. May be repeated." name:"included-build" type:"path"`
+	ProjectDir     string   `help:"Project directory containing included builds and .gradle/." default:"." type:"path"`
+	IncludedBuilds []string `help:"Included build directories whose build/ output to archive. May be repeated." name:"included-build"`
 }
 
-func (c *SaveCmd) AfterApply() error { return c.validate() }
+func (c *SaveCmd) AfterApply() error {
+	if err := c.validate(); err != nil {
+		return err
+	}
+	return validateIncludedBuilds(c.ProjectDir, c.IncludedBuilds)
+}
 
 func (c *SaveCmd) Run(ctx context.Context, metrics gradlecache.MetricsClient) error {
 	slog.Debug(gradleUserHomeEnv, "path", c.GradleUserHome)
@@ -149,6 +189,7 @@ func (c *SaveCmd) Run(ctx context.Context, metrics gradlecache.MetricsClient) er
 		Commit:         c.Commit,
 		GitDir:         c.GitDir,
 		GradleUserHome: c.GradleUserHome,
+		ProjectDir:     c.ProjectDir,
 		IncludedBuilds: c.IncludedBuilds,
 		Metrics:        metrics,
 	})
@@ -162,10 +203,15 @@ type SaveDeltaCmd struct {
 	Branch         string   `help:"Branch name to save the delta under." required:""`
 	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME" type:"path"`
 	ProjectDir     string   `help:"Project directory to scan for project-specific cache changes." type:"path"`
-	IncludedBuilds []string `help:"Included build directories whose build/ output to include in delta. May be repeated." name:"included-build" type:"path"`
+	IncludedBuilds []string `help:"Included build directories whose build/ output to include in delta. May be repeated." name:"included-build"`
 }
 
-func (c *SaveDeltaCmd) AfterApply() error { return c.validate() }
+func (c *SaveDeltaCmd) AfterApply() error {
+	if err := c.validate(); err != nil {
+		return err
+	}
+	return validateIncludedBuilds(c.ProjectDir, c.IncludedBuilds)
+}
 
 func (c *SaveDeltaCmd) Run(ctx context.Context, metrics gradlecache.MetricsClient) error {
 	slog.Debug(gradleUserHomeEnv, "path", c.GradleUserHome)

@@ -219,6 +219,8 @@ type RestoreConfig struct {
 	MaxBlocks int
 	// GradleUserHome is the path to GRADLE_USER_HOME. Defaults to ~/.gradle.
 	GradleUserHome string
+	// ProjectDir is the project directory; defaults to cwd.
+	ProjectDir string
 	// IncludedBuilds lists included build directories whose build/ output to
 	// restore (relative to project root). Defaults to ["buildSrc"].
 	IncludedBuilds []string
@@ -231,6 +233,11 @@ type RestoreConfig struct {
 }
 
 // defaultRegion returns the AWS region from environment variables, falling back to us-west-2.
+func defaultProjectDir() string {
+	wd, _ := os.Getwd()
+	return wd
+}
+
 func defaultRegion() string {
 	if r := os.Getenv("AWS_REGION"); r != "" {
 		return r
@@ -257,6 +264,9 @@ func (c *RestoreConfig) defaults() {
 	if c.GradleUserHome == "" {
 		home, _ := os.UserHomeDir()
 		c.GradleUserHome = filepath.Join(home, ".gradle")
+	}
+	if c.ProjectDir == "" {
+		c.ProjectDir = defaultProjectDir()
 	}
 	if len(c.IncludedBuilds) == 0 {
 		c.IncludedBuilds = []string{"buildSrc"}
@@ -410,15 +420,10 @@ func Restore(ctx context.Context, cfg RestoreConfig) error {
 	entries, _ := os.ReadDir(cfg.GradleUserHome)
 	gradleUserHomeEmpty := len(entries) == 0
 
-	projectDir, err := os.Getwd()
-	if err != nil {
-		return errors.Wrap(err, "get working directory")
-	}
-
 	rules := []extractRule{
 		{prefix: "caches/", baseDir: cfg.GradleUserHome},
 		{prefix: "wrapper/", baseDir: cfg.GradleUserHome},
-		{prefix: "configuration-cache/", baseDir: filepath.Join(projectDir, ".gradle")},
+		{prefix: "configuration-cache/", baseDir: filepath.Join(cfg.ProjectDir, ".gradle")},
 	}
 
 	body, err := store.get(ctx, hitCommit, cfg.CacheKey, hitInfo)
@@ -429,7 +434,7 @@ func Restore(ctx context.Context, cfg RestoreConfig) error {
 
 	cb := &countingBody{r: body, dlStart: dlStart}
 	netTiming := &timingReader{r: cb}
-	ps, err := extractBundleZstd(ctx, netTiming, rules, projectDir, !gradleUserHomeEmpty)
+	ps, err := extractBundleZstd(ctx, netTiming, rules, cfg.ProjectDir, !gradleUserHomeEmpty)
 	if err != nil {
 		return errors.Wrap(err, "extract bundle")
 	}
@@ -495,7 +500,7 @@ func Restore(ctx context.Context, cfg RestoreConfig) error {
 					"speed_mbps", fmt.Sprintf("%.1f", float64(dr.n)/dlElapsed.Seconds()/1e6))
 			}
 			applyStart := time.Now()
-			if err := extractDeltaTarZstdRouted(dr.tmpFile, rules, projectDir); err != nil {
+			if err := extractDeltaTarZstdRouted(dr.tmpFile, rules, cfg.ProjectDir); err != nil {
 				return errors.Wrap(err, "extract delta bundle")
 			}
 			applyElapsed := time.Since(applyStart)
