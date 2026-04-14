@@ -46,10 +46,7 @@ func (c *RestoreDeltaConfig) defaults() {
 		c.GradleUserHome = filepath.Join(home, ".gradle")
 	}
 	if c.ProjectDir == "" {
-		wd, err := os.Getwd()
-		if err == nil {
-			c.ProjectDir = wd
-		}
+		c.ProjectDir = defaultProjectDir()
 	}
 	if c.Metrics == nil {
 		c.Metrics = NoopMetrics{}
@@ -132,6 +129,7 @@ type SaveConfig struct {
 	Commit         string
 	GitDir         string
 	GradleUserHome string
+	ProjectDir     string // project directory; defaults to cwd
 	IncludedBuilds []string
 	SkipWarm       bool // skip page cache warming (for benchmarking cold baseline)
 	Metrics        MetricsClient
@@ -148,6 +146,9 @@ func (c *SaveConfig) defaults() {
 	if c.GradleUserHome == "" {
 		home, _ := os.UserHomeDir()
 		c.GradleUserHome = filepath.Join(home, ".gradle")
+	}
+	if c.ProjectDir == "" {
+		c.ProjectDir = defaultProjectDir()
 	}
 	if len(c.IncludedBuilds) == 0 {
 		c.IncludedBuilds = []string{"buildSrc"}
@@ -191,18 +192,14 @@ func Save(ctx context.Context, cfg SaveConfig) error {
 		return nil
 	}
 
-	projectDir, err := os.Getwd()
-	if err != nil {
-		return errors.Wrap(err, "get working directory")
-	}
-	if err := validateProjectDir(projectDir); err != nil {
+	if err := validateProjectDir(cfg.ProjectDir); err != nil {
 		return err
 	}
 	sources := []TarSource{{BaseDir: cfg.GradleUserHome, Path: "./caches"}}
 	if fi, err := os.Stat(filepath.Join(cfg.GradleUserHome, "wrapper")); err == nil && fi.IsDir() {
 		sources = append(sources, TarSource{BaseDir: cfg.GradleUserHome, Path: "./wrapper"})
 	}
-	sources = append(sources, ProjectDirSources(projectDir, cfg.IncludedBuilds)...)
+	sources = append(sources, ProjectDirSources(cfg.ProjectDir, cfg.IncludedBuilds)...)
 
 	pr, pw := io.Pipe()
 
@@ -297,10 +294,7 @@ func (c *SaveDeltaConfig) defaults() {
 		c.GradleUserHome = filepath.Join(home, ".gradle")
 	}
 	if c.ProjectDir == "" {
-		wd, err := os.Getwd()
-		if err == nil {
-			c.ProjectDir = wd
-		}
+		c.ProjectDir = defaultProjectDir()
 	}
 	if c.Metrics == nil {
 		c.Metrics = NoopMetrics{}
