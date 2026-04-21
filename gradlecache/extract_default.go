@@ -60,9 +60,10 @@ var largeChunkPool = sync.Pool{
 // single large file. The reader closes chunks after dispatching all bytes,
 // allowing it to advance to the next tar entry before the write finishes.
 type largeWriteJob struct {
-	target string
-	mode   os.FileMode
-	chunks chan *[]byte // closed by reader when all chunks are dispatched
+	target       string
+	mode         os.FileMode
+	expectedSize int64
+	chunks       chan *[]byte // closed by reader when all chunks are dispatched
 }
 
 func extractWorkerCount() int {
@@ -136,10 +137,13 @@ func extractTarParallelRouted(r io.Reader, targetFn func(string) string, skipExi
 					}
 					return errors.Errorf("open %s: %w", filepath.Base(job.target), err)
 				}
+				var written int64
 				var writeErr error
 				for buf := range job.chunks {
 					if writeErr == nil {
-						if _, err := f.Write(*buf); err != nil {
+						n, err := f.Write(*buf)
+						written += int64(n)
+						if err != nil {
 							writeErr = errors.Errorf("write %s: %w", filepath.Base(job.target), err)
 						}
 					}
@@ -148,6 +152,12 @@ func extractTarParallelRouted(r io.Reader, targetFn func(string) string, skipExi
 				}
 				if err := f.Close(); err != nil && writeErr == nil {
 					writeErr = errors.Errorf("close %s: %w", filepath.Base(job.target), err)
+				}
+				// Remove partially-written files. This catches both write
+				// errors and truncated archives where the reader closes the
+				// chunks channel early.
+				if writeErr != nil || written != job.expectedSize {
+					os.Remove(job.target) //nolint:errcheck,gosec
 				}
 				if writeErr != nil {
 					return writeErr
@@ -240,7 +250,7 @@ func processEntry(
 			// falls behind on disk writes).
 			chunks := make(chan *[]byte, largeChunkCap)
 			select {
-			case largeJobs <- largeWriteJob{target: target, mode: hdr.FileInfo().Mode(), chunks: chunks}:
+			case largeJobs <- largeWriteJob{target: target, mode: hdr.FileInfo().Mode(), expectedSize: hdr.Size, chunks: chunks}:
 			case <-ctx.Done():
 				return errors.Wrap(ctx.Err(), "context cancelled waiting for large-file worker")
 			}

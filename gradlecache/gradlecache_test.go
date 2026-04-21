@@ -755,6 +755,7 @@ func TestDeltaTarZstdRoundTrip(t *testing.T) {
 	// Touch the marker.
 	markerPath := filepath.Join(gradleHome, ".cache-restore-marker")
 	must(t, touchMarkerFile(markerPath))
+	time.Sleep(10 * time.Millisecond)
 
 	// Write a "new" file after the marker — this is what the build created.
 	newFile := filepath.Join(cachesDir, "modules-2", "new.jar")
@@ -816,6 +817,11 @@ func TestSaveDeltaDefaultsProjectDirToWorkingDirectory(t *testing.T) {
 
 	markerPath := filepath.Join(gradleHome, ".cache-restore-marker")
 	must(t, touchMarkerFile(markerPath))
+
+	// Sleep to ensure files created below have a strictly newer mtime than
+	// the marker. On Linux ext4 the mtime granularity is 1 ms, but rapid
+	// file creation can land on the same timestamp.
+	time.Sleep(10 * time.Millisecond)
 
 	ccDir := filepath.Join(projectDir, ".gradle", "configuration-cache")
 	must(t, os.MkdirAll(ccDir, 0o755))
